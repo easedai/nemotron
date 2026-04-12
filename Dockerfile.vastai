@@ -21,7 +21,7 @@
 #     -t your_org/nemotron:vllm-nemotron-30b-a3b-bf16 \
 #     .
 #
-ARG VLLM_TAG=latest
+ARG VLLM_TAG=v0.19.0-cuda-13.0
 FROM vastai/vllm:${VLLM_TAG}
 
 # ── Model selection ────────────────────────────────────────────────────────────
