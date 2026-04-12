@@ -18,7 +18,7 @@
 #     -t ghcr.io/easedai/nemotron:30b-a3b-bf16 \
 #     .
 #
-FROM public.ecr.aws/deep-learning-containers/vllm:0.19.0-gpu-py312-cu129-ubuntu22.04-ec2
+FROM vllm/vllm-openai:latest
 
 # ── Model selection ────────────────────────────────────────────────────────────
 # Override at build time via --build-arg. MODEL_DIR becomes the subdirectory

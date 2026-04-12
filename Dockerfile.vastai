@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # Bakes model weights directly into the image at build time.
-# Uses vastai/vllm as the base — optimised for vast.ai GPU instances.
+# Uses vllm/vllm-openai:latest as the base — optimised for vast.ai GPU instances.
 # Model is selected via build args — defaults to Nemotron Nano 12B VL BF16.
 #
 # Build locally:
@@ -22,8 +22,7 @@
 #     .
 #
 
-ARG VLLM_TAG=v0.19.0-cuda-13.0
-FROM vastai/vllm:${VLLM_TAG}
+FROM vllm/vllm-openai:latest
 
 # ── Model selection ────────────────────────────────────────────────────────────
 # Override at build time via --build-arg. MODEL_DIR becomes the subdirectory
