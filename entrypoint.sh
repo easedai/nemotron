@@ -4,28 +4,49 @@
 # instance so every worker is independently authenticated.
 set -eo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/root/.cache/huggingface/nemotron-nano-12b-vl-bf16}"
-VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
-VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.95}"
+# ── Cache directories ──────────────────────────────────────────────────────────
+# HF_HOME and VLLM_CACHE_ROOT are baked into the image via ENV in the Dockerfile.
+# They can be overridden at runtime but must match the build-time values so vLLM
+# resolves MODEL_ID to the baked-in weights without a network download.
+export HF_HOME="${HF_HOME:-/hf}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/vllm-cache}"
+export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
+export VLLM_VIDEO_LOADER_BACKEND="${VLLM_VIDEO_LOADER_BACKEND:-opencv}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
+# MODEL_ID is baked into the image by the Dockerfile ARG→ENV chain.
+# The orchestrator can override it at runtime if needed.
+MODEL_ID="${MODEL_ID:-nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16}"
 VLLM_PORT="${VLLM_PORT:-8080}"
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.95}"
 
 if [ -z "${VLLM_API_KEY:-}" ]; then
   echo "[entrypoint] WARNING: VLLM_API_KEY is not set — API will be unauthenticated"
 fi
 
-echo "[entrypoint] Starting vLLM — model: ${MODEL_PATH}"
-echo "[entrypoint] Max model len: ${VLLM_MAX_MODEL_LEN}"
-echo "[entrypoint] GPU memory utilization: ${VLLM_GPU_MEMORY_UTILIZATION}"
-echo "[entrypoint] Port: ${VLLM_PORT}"
+echo "[entrypoint] HF_HOME=${HF_HOME}  VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}"
+echo "[entrypoint] model=${MODEL_ID}  port=${VLLM_PORT}  max_model_len=${VLLM_MAX_MODEL_LEN}"
 
-exec python -m vllm.entrypoints.openai.api_server \
-  --model              "${MODEL_PATH}" \
-  --dtype              bfloat16 \
-  --port               "${VLLM_PORT}" \
-  --host               0.0.0.0 \
-  --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
-  --max-model-len      "${VLLM_MAX_MODEL_LEN}" \
-  --enforce-eager \
+set -- \
+  --model                   "${MODEL_ID}" \
   --trust-remote-code \
-  --no-enable-log-requests \
-  ${VLLM_API_KEY:+--api-key "${VLLM_API_KEY}"}
+  --port                    "${VLLM_PORT}" \
+  --host                    0.0.0.0 \
+  --gpu-memory-utilization  "${VLLM_GPU_MEMORY_UTILIZATION}" \
+  --max-model-len           "${VLLM_MAX_MODEL_LEN}" \
+  --served-model-name       "${MODEL_ID}" \
+  --data-parallel-size      1
+
+# Vision-Language models: add video/multimodal flags
+# Matches any model ID containing "-VL-" or ending in "-VL" (case-sensitive).
+if [[ "${MODEL_ID}" == *"-VL-"* || "${MODEL_ID}" == *"-VL" ]]; then
+  set -- "$@" \
+    --media-io-kwargs        '{"video": {"fps": 2, "num_frames": 128}}' \
+    --allowed-local-media-path / \
+    --video-pruning-rate     0.75
+fi
+
+[ -n "${VLLM_API_KEY:-}" ] && set -- "$@" --api-key "${VLLM_API_KEY}"
+
+exec python3 -m vllm.entrypoints.openai.api_server "$@"

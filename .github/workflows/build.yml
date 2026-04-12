@@ -2,10 +2,10 @@ name: Build & push worker image
 
 # ── Supported models ──────────────────────────────────────────────────────────
 #
-#  image_tag        │ model_id                                        │ weights │ runner
-#  ─────────────────┼─────────────────────────────────────────────────┼─────────┼──────────────
-#  12b-vl-bf16      │ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16      │ ~24 GB  │ ubuntu-latest (free, after disk cleanup)
-#  30b-a3b-bf16     │ nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16      │ ~60 GB  │ self-hosted   (needs ≥ 120 GB free disk)
+#  image_tag    │ model_id                                        │ weights │ runner
+#  ─────────────┼─────────────────────────────────────────────────┼─────────┼──────────────
+#  12b-vl-bf16  │ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16      │ ~24 GB  │ ubuntu-latest (after disk cleanup)
+#  30b-a3b-bf16 │ nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16      │ ~60 GB  │ self-hosted   (needs >= 120 GB free disk)
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -33,8 +33,6 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 # ── 1. Generate matrix ─────────────────────────────────────────────────────────
-# Filters to a single model when workflow_dispatch specifies one;
-# otherwise builds every registered model.
 
 jobs:
   prepare:
@@ -51,18 +49,16 @@ jobs:
           {
             "include": [
               {
-                "image_tag":  "12b-vl-bf16",
-                "model_id":   "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
-                "model_dir":  "nemotron-nano-12b-vl-bf16",
-                "latest":     "true",
-                "runner":     "ubuntu-latest"
+                "image_tag": "12b-vl-bf16",
+                "model_id":  "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
+                "latest":    "true",
+                "runner":    "ubuntu-latest"
               },
               {
-                "image_tag":  "30b-a3b-bf16",
-                "model_id":   "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-                "model_dir":  "nemotron-30b-a3b-bf16",
-                "latest":     "false",
-                "runner":     "self-hosted"
+                "image_tag": "30b-a3b-bf16",
+                "model_id":  "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+                "latest":    "false",
+                "runner":    "self-hosted"
               }
             ]
           }
@@ -84,7 +80,7 @@ jobs:
   build:
     needs: prepare
     strategy:
-      fail-fast: false   # don't cancel other models if one fails
+      fail-fast: false
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     runs-on: ${{ matrix.runner }}
@@ -94,12 +90,11 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
-      # ── Disk preparation ────────────────────────────────────────────────────
       # ubuntu-latest has ~14 GB free; removing unused toolchains gives ~54 GB.
       # Sufficient for the 12B image (~40 GB total).
-      # The 30B model (~75 GB image) requires a self-hosted runner with ≥ 120 GB.
+      # The 30B model (~75 GB image) requires a self-hosted runner with >= 120 GB.
       - name: Free up disk space (ubuntu-latest only)
         if: matrix.runner == 'ubuntu-latest'
         uses: jlumbroso/free-disk-space@v1.3.1
@@ -115,17 +110,15 @@ jobs:
       - name: Show available disk
         run: df -h /
 
-      # ── Registry login ──────────────────────────────────────────────────────
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Image tags ──────────────────────────────────────────────────────────
-      # Each model gets its own stable tag (e.g. :12b-vl-bf16) plus an
-      # immutable SHA tag.  :latest tracks the default model (12b-vl-bf16).
+      # Each model gets its own stable tag plus an immutable SHA tag.
+      # :latest tracks the default model (12b-vl-bf16).
       - name: Generate image tags
         id: tags
         run: |
@@ -139,21 +132,20 @@ jobs:
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
           echo "Built tags: $TAGS"
 
-      # ── Build ───────────────────────────────────────────────────────────────
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
       - name: Build and push — ${{ matrix.image_tag }}
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             MODEL_ID=${{ matrix.model_id }}
-            MODEL_DIR=${{ matrix.model_dir }}
           secrets: |
-            hf_token=${{ secrets.HF_TOKEN }}
-          # Scope the cache key per model so different models don't share layers
-          cache-from: type=gha,scope=${{ matrix.image_tag }}
-          cache-to:   type=gha,scope=${{ matrix.image_tag }},mode=max
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
+          # Registry cache has no 10 GB GHA limit — the ~24 GB model layer
+          # actually persists between runs. Scoped per model tag.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.image_tag }}
+          cache-to:   type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.image_tag }},mode=max
