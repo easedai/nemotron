@@ -4,31 +4,25 @@ Public Docker image for the [eased](https://github.com/easedai/eased) GPU worker
 Bakes **Nvidia Nemotron** weights into the image so vast.ai instances need no
 separate model download on cold start.
 
-Two base-image variants are maintained in parallel:
-
-| Variant | Base image | Workflow | Tag prefix |
-|---|---|---|---|
-| **AWS ECR** | `public.ecr.aws/deep-learning-containers/vllm:0.19.0-gpu-py312-cu129-ubuntu22.04-ec2` | `build.yml` | `ghcr.io/<org>/nemotron:<model>` |
-| **vast.ai** | `vastai/vllm:latest` | `build-vastai.yml` | `ghcr.io/<org>/nemotron:vllm-nemotron-<model>` |
+Built from `vllm/vllm-openai:latest`. Workflow: `build.yml`.
 
 ---
 
 ## Supported models
 
-| Model | HuggingFace ID | Weights | AWS ECR tag | vast.ai tag |
-|---|---|---|---|---|
-| Nemotron Nano 12B VL BF16 | `nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16` | ~24 GB | `12b-vl-bf16` / `latest` | `vllm-nemotron-12b-vl-bf16` / `vllm-nemotron-latest` |
-| Nemotron 3 Nano 30B A3B BF16 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | ~60 GB | `30b-a3b-bf16` | `vllm-nemotron-30b-a3b-bf16` |
+| Model | HuggingFace ID | Weights | Tag |
+|---|---|---|---|
+| Nemotron Nano 12B VL BF16 | `nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16` | ~24 GB | `12b-vl-bf16` / `latest` |
 
 ---
 
-## Image contents (12B example)
+## Image contents
 
-| Layer | AWS ECR variant | vast.ai variant |
-|---|---|---|
-| vLLM base | ~15 GB | ~15 GB |
-| Nemotron Nano 12B VL BF16 weights | ~24 GB | ~24 GB |
-| **Total** | **~40 GB** | **~40 GB** |
+| Layer | Size |
+|---|---|
+| vLLM base | ~15 GB |
+| Nemotron Nano 12B VL BF16 weights | ~24 GB |
+| **Total** | **~40 GB** |
 
 ---
 
@@ -66,49 +60,10 @@ target code has changed in a newer vLLM release.
 
 ## Building locally
 
-### AWS ECR base (`Dockerfile`)
-
 ```bash
-# Default model (12B):
 DOCKER_BUILDKIT=1 docker build \
-  --secret id=hf_token,env=HF_TOKEN \
+  --secret id=HF_TOKEN,env=HF_TOKEN \
   -t ghcr.io/<org>/nemotron:12b-vl-bf16 \
-  .
-
-# 30B model:
-DOCKER_BUILDKIT=1 docker build \
-  --secret id=hf_token,env=HF_TOKEN \
-  --build-arg MODEL_ID=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
-  --build-arg MODEL_DIR=nemotron-30b-a3b-bf16 \
-  -t ghcr.io/<org>/nemotron:30b-a3b-bf16 \
-  .
-```
-
-### vast.ai base (`Dockerfile.vastai`)
-
-```bash
-# Default model (12B):
-DOCKER_BUILDKIT=1 docker build \
-  --secret id=hf_token,env=HF_TOKEN \
-  -f Dockerfile.vastai \
-  -t ghcr.io/<org>/nemotron:vllm-nemotron-12b-vl-bf16 \
-  .
-
-# Pin to a specific vastai/vllm base tag:
-DOCKER_BUILDKIT=1 docker build \
-  --secret id=hf_token,env=HF_TOKEN \
-  --build-arg VLLM_TAG=0.8.5 \
-  -f Dockerfile.vastai \
-  -t ghcr.io/<org>/nemotron:vllm-nemotron-12b-vl-bf16 \
-  .
-
-# 30B model:
-DOCKER_BUILDKIT=1 docker build \
-  --secret id=hf_token,env=HF_TOKEN \
-  --build-arg MODEL_ID=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
-  --build-arg MODEL_DIR=nemotron-30b-a3b-bf16 \
-  -f Dockerfile.vastai \
-  -t ghcr.io/<org>/nemotron:vllm-nemotron-30b-a3b-bf16 \
   .
 ```
 
@@ -119,24 +74,17 @@ passed as a BuildKit secret and is **never** written into any image layer.
 
 ## GitHub Actions
 
-### `build.yml` — AWS ECR variant
+### `build.yml`
 
-Triggers on push to `main` touching `Dockerfile`, `entrypoint.sh`, or `build.yml`.
-Runs on `ubuntu-latest` (free tier) for the 12B model; requires a self-hosted runner
-with ≥ 120 GB free disk for the 30B model.
+Triggers on push to `main` touching `Dockerfile`, `entrypoint.sh`, `patch_vllm.py`,
+or `build.yml`. Runs on `ubuntu-latest` after disk cleanup (~54 GB free, sufficient
+for the 12B image).
 
-Tags pushed: `12b-vl-bf16`, `12b-vl-bf16-sha-<sha>`, `latest` (12B on main).
+Tags pushed: `12b-vl-bf16`, `12b-vl-bf16-sha-<sha>`, `latest` (on main).
 
-### `build-vastai.yml` — vast.ai variant
+### `build-vastai.yml`
 
-Triggers on push to `main` touching `Dockerfile.vastai`, `entrypoint.sh`, or
-`build-vastai.yml`. Same runner requirements as above.
-
-Tags pushed: `vllm-nemotron-12b-vl-bf16`, `vllm-nemotron-12b-vl-bf16-sha-<sha>`,
-`vllm-nemotron-latest` (12B on main).
-
-The `workflow_dispatch` trigger accepts an optional `vllm_tag` input to build against
-a specific `vastai/vllm` base tag (defaults to `latest`).
+Disabled (no push trigger). Kept for reference only.
 
 ### Required repository secret
 

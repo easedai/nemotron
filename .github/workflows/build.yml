@@ -1,32 +1,14 @@
 name: Build & push worker image
 
-# ── Supported models ──────────────────────────────────────────────────────────
-#
-#  image_tag    │ model_id                                        │ weights │ runner
-#  ─────────────┼─────────────────────────────────────────────────┼─────────┼──────────────
-#  12b-vl-bf16  │ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16      │ ~24 GB  │ ubuntu-latest (after disk cleanup)
-#  30b-a3b-bf16 │ nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16      │ ~60 GB  │ self-hosted   (needs >= 120 GB free disk)
-#
-# ─────────────────────────────────────────────────────────────────────────────
-
 on:
   push:
     branches: [main]
     paths:
       - "Dockerfile"
       - "entrypoint.sh"
+      - "patch_vllm.py"
       - ".github/workflows/build.yml"
   workflow_dispatch:
-    inputs:
-      model:
-        description: "Model variant to build"
-        required: false
-        default: all
-        type: choice
-        options:
-          - all
-          - 12b-vl-bf16
-          - 30b-a3b-bf16
 
 # Deny all permissions by default; each job grants only what it needs.
 permissions: {}
@@ -35,60 +17,9 @@ env:
   REGISTRY:   ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
-# ── 1. Generate matrix ─────────────────────────────────────────────────────────
-
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      matrix: ${{ steps.matrix.outputs.value }}
-    steps:
-      - name: Resolve build matrix
-        id: matrix
-        env:
-          SELECTED: ${{ github.event.inputs.model }}
-        run: |
-          ALL=$(cat <<'EOF'
-          {
-            "include": [
-              {
-                "image_tag": "12b-vl-bf16",
-                "model_id":  "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
-                "latest":    "true",
-                "runner":    "ubuntu-latest"
-              },
-              {
-                "image_tag": "30b-a3b-bf16",
-                "model_id":  "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-                "latest":    "false",
-                "runner":    "self-hosted"
-              }
-            ]
-          }
-          EOF
-          )
-
-          if [ -z "$SELECTED" ] || [ "$SELECTED" = "all" ]; then
-            echo "Building all models"
-            echo "value=$(echo "$ALL" | jq -c .)" >> "$GITHUB_OUTPUT"
-          else
-            echo "Building single model: $SELECTED"
-            FILTERED=$(echo "$ALL" | jq -c --arg tag "$SELECTED" \
-              '{include: [.include[] | select(.image_tag == $tag)]}')
-            echo "value=$FILTERED" >> "$GITHUB_OUTPUT"
-          fi
-
-# ── 2. Build each model ────────────────────────────────────────────────────────
-
   build:
-    needs: prepare
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
-
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
@@ -99,9 +30,7 @@ jobs:
 
       # ubuntu-latest has ~14 GB free; removing unused toolchains gives ~54 GB.
       # Sufficient for the 12B image (~40 GB total).
-      # The 30B model (~75 GB image) requires a self-hosted runner with >= 120 GB.
-      - name: Free up disk space (ubuntu-latest only)
-        if: matrix.runner == 'ubuntu-latest'
+      - name: Free up disk space
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache:     true
@@ -122,16 +51,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Each model gets its own stable tag plus an immutable SHA tag.
-      # :latest tracks the default model (12b-vl-bf16).
       - name: Generate image tags
         id: tags
         run: |
           BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           SHA="${GITHUB_SHA::7}"
-          TAG="${{ matrix.image_tag }}"
-          TAGS="${BASE}:${TAG},${BASE}:${TAG}-sha-${SHA}"
-          if [ "${{ matrix.latest }}" = "true" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          TAGS="${BASE}:12b-vl-bf16,${BASE}:12b-vl-bf16-sha-${SHA}"
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
             TAGS="${TAGS},${BASE}:latest"
           fi
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
@@ -140,17 +66,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push — ${{ matrix.image_tag }}
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
-            MODEL_ID=${{ matrix.model_id }}
+            MODEL_ID=nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16
           secrets: |
             HF_TOKEN=${{ secrets.HF_TOKEN }}
-          # Registry cache has no 10 GB GHA limit — the ~24 GB model layer
-          # actually persists between runs. Scoped per model tag.
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.image_tag }}
-          cache-to:   type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.image_tag }},mode=max
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-12b-vl-bf16
+          cache-to:   type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-12b-vl-bf16,mode=max

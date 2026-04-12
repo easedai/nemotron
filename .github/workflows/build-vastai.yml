@@ -9,25 +9,10 @@ name: Build & push vastai worker image
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Disabled — vast.ai builds are handled by the main build.yml (Dockerfile.vastai
+# is no longer the active image).  Kept for reference; no triggers are set.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "Dockerfile.vastai"
-      - "entrypoint.sh"
-      - "onstart.sh"
-      - ".github/workflows/build-vastai.yml"
   workflow_dispatch:
-    inputs:
-      model:
-        description: "Model variant to build"
-        required: false
-        default: all
-        type: choice
-        options:
-          - all
-          - vllm-nemotron-12b-vl-bf16
-          - vllm-nemotron-30b-a3b-bf16
 
 # Deny all permissions by default; each job grants only what it needs.
 permissions: {}
