@@ -94,7 +94,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # ── Disk preparation ────────────────────────────────────────────────────
       # ubuntu-latest has ~14 GB free; removing unused toolchains gives ~54 GB.
