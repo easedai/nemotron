@@ -1,0 +1,166 @@
+name: Build & push vastai/vllm worker image
+
+# ── Supported models ──────────────────────────────────────────────────────────
+#
+#  image_tag                  │ model_id                                        │ weights │ runner
+#  ───────────────────────────┼─────────────────────────────────────────────────┼─────────┼──────────────
+#  vllm-nemotron-12b-vl-bf16  │ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16      │ ~24 GB  │ ubuntu-latest (free, after disk cleanup)
+#  vllm-nemotron-30b-a3b-bf16 │ nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16      │ ~60 GB  │ self-hosted   (needs ≥ 120 GB free disk)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.vastai"
+      - "entrypoint.sh"
+      - ".github/workflows/build-vastai.yml"
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model variant to build"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - vllm-nemotron-12b-vl-bf16
+          - vllm-nemotron-30b-a3b-bf16
+      vllm_tag:
+        description: "vastai/vllm base image tag"
+        required: false
+        default: latest
+        type: string
+
+env:
+  REGISTRY:   ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# ── 1. Generate matrix ─────────────────────────────────────────────────────────
+# Filters to a single model when workflow_dispatch specifies one;
+# otherwise builds every registered model.
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.value }}
+    steps:
+      - name: Resolve build matrix
+        id: matrix
+        env:
+          SELECTED: ${{ github.event.inputs.model }}
+        run: |
+          ALL=$(cat <<'EOF'
+          {
+            "include": [
+              {
+                "image_tag":  "vllm-nemotron-12b-vl-bf16",
+                "model_id":   "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
+                "model_dir":  "nemotron-nano-12b-vl-bf16",
+                "latest":     "true",
+                "runner":     "ubuntu-latest"
+              },
+              {
+                "image_tag":  "vllm-nemotron-30b-a3b-bf16",
+                "model_id":   "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+                "model_dir":  "nemotron-30b-a3b-bf16",
+                "latest":     "false",
+                "runner":     "self-hosted"
+              }
+            ]
+          }
+          EOF
+          )
+
+          if [ -z "$SELECTED" ] || [ "$SELECTED" = "all" ]; then
+            echo "Building all models"
+            echo "value=$(echo "$ALL" | jq -c .)" >> "$GITHUB_OUTPUT"
+          else
+            echo "Building single model: $SELECTED"
+            FILTERED=$(echo "$ALL" | jq -c --arg tag "$SELECTED" \
+              '{include: [.include[] | select(.image_tag == $tag)]}')
+            echo "value=$FILTERED" >> "$GITHUB_OUTPUT"
+          fi
+
+# ── 2. Build each model ────────────────────────────────────────────────────────
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false   # don't cancel other models if one fails
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Disk preparation ────────────────────────────────────────────────────
+      # ubuntu-latest has ~14 GB free; removing unused toolchains gives ~54 GB.
+      # Sufficient for the 12B image (~40 GB total).
+      # The 30B model (~75 GB image) requires a self-hosted runner with ≥ 120 GB.
+      - name: Free up disk space (ubuntu-latest only)
+        if: matrix.runner == 'ubuntu-latest'
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache:     true
+          android:        true
+          dotnet:         true
+          haskell:        true
+          large-packages: true
+          docker-images:  true
+          swap-storage:   true
+
+      - name: Show available disk
+        run: df -h /
+
+      # ── Registry login ──────────────────────────────────────────────────────
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Image tags ──────────────────────────────────────────────────────────
+      # Each model gets its own stable vllm-nemotron-* tag plus an immutable
+      # SHA tag.  vllm-nemotron-latest tracks the default model (12b-vl-bf16).
+      - name: Generate image tags
+        id: tags
+        run: |
+          BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          SHA="${GITHUB_SHA::7}"
+          TAG="${{ matrix.image_tag }}"
+          TAGS="${BASE}:${TAG},${BASE}:${TAG}-sha-${SHA}"
+          if [ "${{ matrix.latest }}" = "true" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TAGS="${TAGS},${BASE}:vllm-nemotron-latest"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Built tags: $TAGS"
+
+      # ── Build ───────────────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push — ${{ matrix.image_tag }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.vastai
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            VLLM_TAG=${{ github.event.inputs.vllm_tag || 'latest' }}
+            MODEL_ID=${{ matrix.model_id }}
+            MODEL_DIR=${{ matrix.model_dir }}
+          secrets: |
+            hf_token=${{ secrets.HF_TOKEN }}
+          # Scope the cache key per model so different models don't share layers
+          cache-from: type=gha,scope=${{ matrix.image_tag }}
+          cache-to:   type=gha,scope=${{ matrix.image_tag }},mode=max
