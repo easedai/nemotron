@@ -52,6 +52,13 @@ RUN --mount=type=secret,id=hf_token \
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 8000
+# vast.ai's ssh_direc/ssh_proxy runtype bypasses the Docker ENTRYPOINT.
+# It runs /root/onstart.sh instead — so we ship one that calls the entrypoint.
+# vast.ai also hardcodes its SSH tunnel to forward localhost:8080, so the
+# container must listen on 8080 (set via VLLM_PORT env var at launch time).
+COPY onstart.sh /root/onstart.sh
+RUN chmod +x /root/onstart.sh
+
+EXPOSE 8080
 
 ENTRYPOINT ["/entrypoint.sh"]
