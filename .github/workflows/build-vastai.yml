@@ -156,7 +156,7 @@ jobs:
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
-            VLLM_TAG=${{ github.event.inputs.vllm_tag || 'latest' }}
+            VLLM_TAG=${{ github.event.inputs.vllm_tag || 'v0.19.0-cuda-13.0' }}
             MODEL_ID=${{ matrix.model_id }}
             MODEL_DIR=${{ matrix.model_dir }}
           secrets: |
