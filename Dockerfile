@@ -7,7 +7,7 @@
 #   # Default model (12B):
 #   DOCKER_BUILDKIT=1 docker build \
 #     --secret id=hf_token,env=HF_TOKEN \
-#     -t ghcr.io/<your-org>/nemotron:12b-vl-bf16 \
+#     -t ghcr.io/easedai/nemotron:12b-vl-bf16 \
 #     .
 #
 #   # Different model:
@@ -15,7 +15,7 @@
 #     --secret id=hf_token,env=HF_TOKEN \
 #     --build-arg MODEL_ID=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
 #     --build-arg MODEL_DIR=nemotron-30b-a3b-bf16 \
-#     -t ghcr.io/<your-org>/nemotron:30b-a3b-bf16 \
+#     -t ghcr.io/easedai/nemotron:30b-a3b-bf16 \
 #     .
 #
 FROM public.ecr.aws/deep-learning-containers/vllm:0.19.0-gpu-py312-cu129-ubuntu22.04-ec2

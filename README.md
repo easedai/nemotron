@@ -1,10 +1,10 @@
 # nemotron-worker
 
-Public Docker image for the [eased](https://github.com/your-org/eased) GPU worker.
+Public Docker image for the [eased](https://github.com/easedai/eased) GPU worker.
 Bakes **Nvidia Nemotron Nano 12B VL BF16** weights into the image so vast.ai instances
 need no separate model download on cold start.
 
-Published to: `ghcr.io/your-org/nemotron:latest`
+Published to: `ghcr.io/easedai/nemotron:latest`
 
 ---
 
@@ -32,7 +32,7 @@ These are injected by the eased orchestrator at launch time via vast.ai:
 ```bash
 DOCKER_BUILDKIT=1 docker build \
   --secret id=hf_token,env=HF_TOKEN \
-  -t ghcr.io/your-org/nemotron:latest \
+  -t ghcr.io/easedai/nemotron:latest \
   .
 ```
 
