@@ -29,6 +29,9 @@ on:
           - vllm-nemotron-12b-vl-bf16
           - vllm-nemotron-30b-a3b-bf16
 
+# Deny all permissions by default; each job grants only what it needs.
+permissions: {}
+
 env:
   REGISTRY:   ghcr.io
   IMAGE_NAME: ${{ github.repository }}

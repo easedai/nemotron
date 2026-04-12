@@ -28,6 +28,9 @@ on:
           - 12b-vl-bf16
           - 30b-a3b-bf16
 
+# Deny all permissions by default; each job grants only what it needs.
+permissions: {}
+
 env:
   REGISTRY:   ghcr.io
   IMAGE_NAME: ${{ github.repository }}
@@ -37,6 +40,8 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       matrix: ${{ steps.matrix.outputs.value }}
     steps:
