@@ -45,6 +45,25 @@ Injected by the eased orchestrator at launch time via vast.ai:
 
 ---
 
+## vLLM 0.19.0 patches
+
+vLLM 0.19.0 has five crash sites in the multimodal dummy-input profiling path
+that prevent `NanoNemotronVLProcessor`-based models from starting. The image
+applies [`patch_vllm.py`](patch_vllm.py) at build time to fix all five:
+
+| # | File | Bug | Fix |
+|---|------|-----|-----|
+| 1 | `encoder_budget.py` | `get_dummy_mm_inputs` raises during profiling | try/except fallback to `max_model_len` per modality |
+| 2 | `transformers_utils/processor.py` | `_merge_kwargs` missing on `NanoNemotronVLProcessor` | `hasattr` guard with manual kwarg routing |
+| 3 | `gpu_model_runner.py` | `_get_mm_dummy_batch` raises during encoder profiling | try/except, skip profiling (first real request warms up) |
+| 4 | `nano_nemotron_vl.py` | `video_num_patches[item_idx]` IndexError on empty list | bounds check, return `None` when out of range |
+| 5 | `nano_nemotron_vl.py` | `num_tubelets=None` propagates to EVS pruning (`int * None`) | `None` guard on pruning condition + fallback using frame count |
+
+All patches are idempotent — they skip silently if already applied or if the
+target code has changed in a newer vLLM release.
+
+---
+
 ## Building locally
 
 ### AWS ECR base (`Dockerfile`)

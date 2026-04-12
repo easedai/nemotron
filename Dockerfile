@@ -54,6 +54,11 @@ print('Download complete')"
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# ── vLLM 0.19.0 patches for NanoNemotronVLProcessor compat ──────────────────
+# Five crash sites in the multimodal dummy-input path; applied at build time.
+COPY patch_vllm.py /tmp/patch_vllm.py
+RUN python3 /tmp/patch_vllm.py && rm /tmp/patch_vllm.py
+
 EXPOSE 8000
 
 ENTRYPOINT ["/entrypoint.sh"]
