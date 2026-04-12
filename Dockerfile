@@ -59,6 +59,17 @@ RUN chmod +x /entrypoint.sh
 COPY patch_vllm.py /tmp/patch_vllm.py
 RUN python3 /tmp/patch_vllm.py && rm /tmp/patch_vllm.py
 
-EXPOSE 8000
+# ── vast.ai onstart hook ──────────────────────────────────────────────────────
+# vast.ai's ssh_direc/ssh_proxy runtype bypasses the Docker ENTRYPOINT and
+# runs /root/onstart.sh instead.  The base vllm/vllm-openai image ships
+# /root/onstart.sh as a symlink to /vllm-workspace/onstart.sh, and
+# /vllm-workspace is declared as a Docker VOLUME — so any write through the
+# symlink lands inside the volume path and is discarded at container start.
+# Remove the symlink first so the COPY creates a real file outside the volume.
+RUN rm -f /root/onstart.sh
+COPY onstart.sh /root/onstart.sh
+RUN chmod +x /root/onstart.sh
+
+EXPOSE 8080
 
 ENTRYPOINT ["/entrypoint.sh"]
