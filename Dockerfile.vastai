@@ -60,14 +60,16 @@ COPY vllm.sh /opt/supervisor-scripts/vllm.sh
 RUN chmod +x /opt/supervisor-scripts/vllm.sh
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
-# We own /entrypoint.sh rather than depending on the base image's internal boot
-# chain (/opt/instance-tools/bin/entrypoint.sh → boot_default.sh → boot scripts).
-# vastai_entrypoint.sh simply starts supervisord directly.
+# vast.ai's ssh_direc/ssh_proxy run type bypasses the Docker ENTRYPOINT and
+# calls /root/onstart.sh instead.  We bake that file into the image so it
+# delegates to the base image's own boot chain
+# (/opt/instance-tools/bin/entrypoint.sh → boot_default.sh → boot scripts),
+# which starts supervisord, propagates SSH keys, and applies CUDA compat shims.
 #
-# onstart.sh is run by vast.ai when using ssh_direc/ssh_proxy runtype (the Docker
-# ENTRYPOINT is bypassed).  It delegates to /entrypoint.sh so both paths converge.
-COPY vastai_entrypoint.sh /entrypoint.sh
+# /entrypoint.sh is a short-path alias used both by the baked-in onstart.sh
+# and by the orchestrator's dynamically-written onstart script.
+RUN ln -sf /opt/instance-tools/bin/entrypoint.sh /entrypoint.sh
 COPY onstart.sh /root/onstart.sh
-RUN chmod +x /entrypoint.sh /root/onstart.sh
+RUN chmod +x /root/onstart.sh
 
 EXPOSE 8080
