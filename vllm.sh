@@ -8,25 +8,56 @@ utils=/opt/supervisor-scripts/utils
 [ -f "${utils}/logging.sh" ]     && . "${utils}/logging.sh"
 [ -f "${utils}/environment.sh" ] && . "${utils}/environment.sh"
 
-# Source orchestrator-injected env overrides written by EXTRA_COMMANDS at launch.
-# This is the most reliable injection path for vast.ai ssh_direc/ssh_proxy runtype —
-# the file is written before onstart.sh runs so it's always present when we get here.
-# shellcheck disable=SC1091
-[ -f /etc/vllm-env.sh ] && . /etc/vllm-env.sh
+# ── Orchestrator env discovery ───────────────────────────────────────────────
+# The orchestrator injects config (incl. VLLM_API_KEY) via two paths:
+#   1. Docker -e KEY=VAL flags → container process env
+#   2. EXTRA_COMMANDS writes /etc/vllm-env.sh (sourced below)
+#
+# vast.ai's ssh_direc/ssh_proxy runtype + its base-image boot chain can strip
+# or overwrite either source, so we try every path, log what we find, and only
+# fall through to the insecure "no API key" warning when genuinely nothing
+# is available.
 
-# Fallback: read Docker -e vars directly from PID 1's environ.
-# Useful if the container is started without EXTRA_COMMANDS (e.g. local testing).
-if [ -r /proc/1/environ ]; then
+_env_log=""
+
+# (1) Dedicated key file — simplest fallback, written by EXTRA_COMMANDS.
+if [ -f /etc/vllm-api-key ] && [ -z "${VLLM_API_KEY:-}" ]; then
+  VLLM_API_KEY="$(tr -d '\n\r' < /etc/vllm-api-key)"
+  [ -n "${VLLM_API_KEY}" ] && export VLLM_API_KEY && _env_log="${_env_log}api-key<-/etc/vllm-api-key "
+fi
+
+# (2) /etc/vllm-env.sh — full env override file.
+if [ -f /etc/vllm-env.sh ]; then
+  # shellcheck disable=SC1091
+  . /etc/vllm-env.sh
+  _env_log="${_env_log}vllm-env.sh(loaded) "
+else
+  _env_log="${_env_log}vllm-env.sh(MISSING) "
+fi
+
+# (3) Scan every process's environ for Docker -e vars.
+# Process env lives in kernel memory and can't be overwritten by file writes,
+# so this works even when vast.ai's boot chain clobbers our EXTRA_COMMANDS.
+_scan_found=""
+for _pid_env in /proc/[0-9]*/environ; do
+  [ -r "${_pid_env}" ] || continue
   while IFS= read -r -d '' _kv; do
     _varname="${_kv%%=*}"
-    # Only import if not already set by /etc/vllm-env.sh above.
     case "${_varname}" in
-      VLLM_*|MODEL_ID|HF_HOME|HF_HUB_ENABLE_HF_TRANSFER|TENSOR_PARALLEL_SIZE|DATA_PARALLEL_SIZE|CUDA_VISIBLE_DEVICES)
-        [ -z "${!_varname+x}" ] && export "$_kv" 2>/dev/null || true ;;
+      VLLM_API_KEY|VLLM_PORT|VLLM_MAX_MODEL_LEN|VLLM_GPU_MEMORY_UTILIZATION|VLLM_VIDEO_LOADER_BACKEND|VLLM_CACHE_ROOT|MODEL_ID|HF_HOME|HF_HUB_ENABLE_HF_TRANSFER|TENSOR_PARALLEL_SIZE|DATA_PARALLEL_SIZE|CUDA_VISIBLE_DEVICES)
+        if [ -z "${!_varname+x}" ] || [ -z "${!_varname}" ]; then
+          export "${_varname}=${_kv#*=}"
+          _scan_found="${_scan_found}${_varname} "
+        fi
+        ;;
     esac
-  done < /proc/1/environ
-  unset _kv _varname
-fi
+  done < "${_pid_env}" 2>/dev/null
+done
+unset _kv _varname _pid_env
+[ -n "${_scan_found}" ] && _env_log="${_env_log}scan(${_scan_found% })"
+
+echo "[vllm] env discovery: ${_env_log}"
+unset _env_log _scan_found
 
 # Activate the venv if it exists (vastai base image), otherwise use system Python.
 [ -f /venv/main/bin/activate ] && source /venv/main/bin/activate
