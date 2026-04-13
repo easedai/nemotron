@@ -8,6 +8,26 @@ utils=/opt/supervisor-scripts/utils
 [ -f "${utils}/logging.sh" ]     && . "${utils}/logging.sh"
 [ -f "${utils}/environment.sh" ] && . "${utils}/environment.sh"
 
+# Source orchestrator-injected env overrides written by EXTRA_COMMANDS at launch.
+# This is the most reliable injection path for vast.ai ssh_direc/ssh_proxy runtype —
+# the file is written before onstart.sh runs so it's always present when we get here.
+# shellcheck disable=SC1091
+[ -f /etc/vllm-env.sh ] && . /etc/vllm-env.sh
+
+# Fallback: read Docker -e vars directly from PID 1's environ.
+# Useful if the container is started without EXTRA_COMMANDS (e.g. local testing).
+if [ -r /proc/1/environ ]; then
+  while IFS= read -r -d '' _kv; do
+    _varname="${_kv%%=*}"
+    # Only import if not already set by /etc/vllm-env.sh above.
+    case "${_varname}" in
+      VLLM_*|MODEL_ID|HF_HOME|HF_HUB_ENABLE_HF_TRANSFER|TENSOR_PARALLEL_SIZE|DATA_PARALLEL_SIZE|CUDA_VISIBLE_DEVICES)
+        [ -z "${!_varname+x}" ] && export "$_kv" 2>/dev/null || true ;;
+    esac
+  done < /proc/1/environ
+  unset _kv _varname
+fi
+
 # Activate the venv if it exists (vastai base image), otherwise use system Python.
 [ -f /venv/main/bin/activate ] && source /venv/main/bin/activate
 
