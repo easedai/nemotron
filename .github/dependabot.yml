@@ -1,0 +1,11 @@
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /eased/.github/workflows
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(actions)"

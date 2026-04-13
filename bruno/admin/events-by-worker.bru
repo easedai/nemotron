@@ -1,0 +1,19 @@
+meta {
+  name: Events by Worker ID
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{base_url}}/admin/events/worker/{{worker_id}}?limit=100
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{admin_token}}
+}
+
+vars {
+  worker_id: replace-me
+}

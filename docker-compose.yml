@@ -1,0 +1,58 @@
+# ── Local development stack ────────────────────────────────────────────────────
+#
+# Both services build from the same context (eased/) and share app/ code.
+#
+# Services:
+#   orchestrator    Background worker — manages vast.ai GPU workers (no HTTP)
+#   load-balancer   HTTP API — /v1/* proxy + /admin/* + /health + /workers
+#
+# Usage:
+#   cp .env.example .env   # fill in VASTAI_API_KEY, DISCORD_WEBHOOK_URL, etc.
+#   aws sso login --profile <your-profile>
+#   docker compose up --build
+#
+# Ports:
+#   http://localhost:8000   load-balancer (/v1/*, /admin/*, /workers, /health)
+# DynamoDB: uses real AWS (cloud) — ensure AWS_PROFILE is set and SSO session is active.
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    env_file: .env
+    environment:
+      LOG_LEVEL: DEBUG
+      AWS_DEFAULT_REGION: us-east-1
+      ORCHESTRATOR_ID: local
+    volumes:
+      # Hot-reload source: the shared app/ package
+      - ./app:/app/app
+      # Mount host AWS config so the container can use your SSO session.
+      # Run `aws sso login --profile <your-profile>` on the host before starting.
+      - ${HOME}/.aws:/root/.aws
+    restart: unless-stopped
+
+  load-balancer:
+    build:
+      context: .
+      dockerfile: Dockerfile.lb
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      LOG_LEVEL: DEBUG
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./app:/app/app
+      - ${HOME}/.aws:/root/.aws
+    command: >
+      uvicorn app.lb.main:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+        --reload-include "*.py"
+        --log-level debug
+    restart: unless-stopped

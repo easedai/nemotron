@@ -1,0 +1,29 @@
+meta {
+  name: Chat Completion (Streaming)
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{base_url}}/v1/chat/completions
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "model": "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Write a short poem about GPUs."
+      }
+    ],
+    "max_tokens": 256,
+    "stream": true
+  }
+}

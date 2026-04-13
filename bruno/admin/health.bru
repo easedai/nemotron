@@ -1,0 +1,15 @@
+meta {
+  name: Admin Health
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/admin/health
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{admin_token}}
+}

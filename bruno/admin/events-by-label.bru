@@ -1,0 +1,19 @@
+meta {
+  name: Events by Label
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{base_url}}/admin/events/label/{{label}}?limit=100
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{admin_token}}
+}
+
+vars {
+  label: eased-replace-me
+}
