@@ -3,4 +3,4 @@
 # Output is captured to /var/log/onstart.log.
 # The Docker ENTRYPOINT is bypassed when using ssh_direc/ssh_proxy runtype,
 # so vLLM must be started here instead.
-exec /entrypoint.sh
+exec /opt/instance-tools/bin/entrypoint.sh
