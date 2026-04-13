@@ -59,4 +59,11 @@ COPY vllm.conf /etc/supervisor/conf.d/vllm.conf
 COPY vllm.sh /opt/supervisor-scripts/vllm.sh
 RUN chmod +x /opt/supervisor-scripts/vllm.sh
 
+# ── Vast.ai startup ───────────────────────────────────────────────────────────
+# SSH-based run types bypass the Docker ENTRYPOINT and execute /root/onstart.sh
+# instead, so supervisord (and all supervisor-managed services) must be started
+# from there.
+COPY onstart.sh /root/onstart.sh
+RUN chmod +x /root/onstart.sh
+
 EXPOSE 8080

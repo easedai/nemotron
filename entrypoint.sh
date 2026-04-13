@@ -12,7 +12,6 @@ export HF_HOME="${HF_HOME:-/hf}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/vllm-cache}"
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 export VLLM_VIDEO_LOADER_BACKEND="${VLLM_VIDEO_LOADER_BACKEND:-opencv}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 # MODEL_ID is baked into the image by the Dockerfile ARG→ENV chain.
 # The orchestrator can override it at runtime if needed.
@@ -20,6 +19,16 @@ MODEL_ID="${MODEL_ID:-nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16}"
 VLLM_PORT="${VLLM_PORT:-8080}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.95}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+DATA_PARALLEL_SIZE="${DATA_PARALLEL_SIZE:-1}"
+
+# Auto-generate CUDA_VISIBLE_DEVICES from total GPU count when not explicitly set.
+# With TP=2, DP=1 → "0,1"; TP=1, DP=2 → "0,1"; TP=2, DP=2 → "0,1,2,3".
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+  TOTAL_GPUS=$(( TENSOR_PARALLEL_SIZE * DATA_PARALLEL_SIZE ))
+  CUDA_VISIBLE_DEVICES=$(seq -s, 0 $(( TOTAL_GPUS - 1 )))
+fi
+export CUDA_VISIBLE_DEVICES
 
 if [ -z "${VLLM_API_KEY:-}" ]; then
   echo "[entrypoint] WARNING: VLLM_API_KEY is not set — API will be unauthenticated"
@@ -27,6 +36,7 @@ fi
 
 echo "[entrypoint] HF_HOME=${HF_HOME}  VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}"
 echo "[entrypoint] model=${MODEL_ID}  port=${VLLM_PORT}  max_model_len=${VLLM_MAX_MODEL_LEN}"
+echo "[entrypoint] tensor_parallel=${TENSOR_PARALLEL_SIZE}  data_parallel=${DATA_PARALLEL_SIZE}  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
 set -- \
   --model                   "${MODEL_ID}" \
@@ -36,7 +46,9 @@ set -- \
   --gpu-memory-utilization  "${VLLM_GPU_MEMORY_UTILIZATION}" \
   --max-model-len           "${VLLM_MAX_MODEL_LEN}" \
   --served-model-name       "${MODEL_ID}" \
-  --data-parallel-size      1
+  --data-parallel-size      "${DATA_PARALLEL_SIZE}"
+
+[ "${TENSOR_PARALLEL_SIZE}" -gt 1 ] && set -- "$@" --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}"
 
 # Vision-Language models: add video/multimodal flags
 # Matches any model ID containing "-VL-" or ending in "-VL" (case-sensitive).
