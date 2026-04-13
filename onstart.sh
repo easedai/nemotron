@@ -2,5 +2,9 @@
 # vast.ai runs this file on container start via its .launch script.
 # Output is captured to /var/log/onstart.log.
 # The Docker ENTRYPOINT is bypassed when using ssh_direc/ssh_proxy runtype,
-# so vLLM must be started here instead.
-exec /opt/instance-tools/bin/entrypoint.sh
+# so we exec our own /entrypoint.sh instead.
+#
+# Both image variants bake /entrypoint.sh at build time:
+#   Dockerfile        → entrypoint.sh (direct vLLM launch)
+#   Dockerfile.vastai → vastai_entrypoint.sh (starts supervisord → vllm.sh)
+exec /entrypoint.sh "$@"

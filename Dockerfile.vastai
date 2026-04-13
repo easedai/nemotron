@@ -59,11 +59,15 @@ COPY vllm.conf /etc/supervisor/conf.d/vllm.conf
 COPY vllm.sh /opt/supervisor-scripts/vllm.sh
 RUN chmod +x /opt/supervisor-scripts/vllm.sh
 
-# ── Vast.ai startup ───────────────────────────────────────────────────────────
-# SSH-based run types bypass the Docker ENTRYPOINT and execute /root/onstart.sh
-# instead, so supervisord (and all supervisor-managed services) must be started
-# from there.
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+# We own /entrypoint.sh rather than depending on the base image's internal boot
+# chain (/opt/instance-tools/bin/entrypoint.sh → boot_default.sh → boot scripts).
+# vastai_entrypoint.sh simply starts supervisord directly.
+#
+# onstart.sh is run by vast.ai when using ssh_direc/ssh_proxy runtype (the Docker
+# ENTRYPOINT is bypassed).  It delegates to /entrypoint.sh so both paths converge.
+COPY vastai_entrypoint.sh /entrypoint.sh
 COPY onstart.sh /root/onstart.sh
-RUN chmod +x /root/onstart.sh
+RUN chmod +x /entrypoint.sh /root/onstart.sh
 
 EXPOSE 8080
