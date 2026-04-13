@@ -5,13 +5,18 @@ name: Build & push vastai worker image
 #  image_tag                  │ model_id                                        │ weights │ runner
 #  ───────────────────────────┼─────────────────────────────────────────────────┼─────────┼──────────────
 #  vllm-nemotron-12b-vl-bf16  │ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16      │ ~24 GB  │ ubuntu-latest (after disk cleanup)
-#  vllm-nemotron-30b-a3b-bf16 │ nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16      │ ~60 GB  │ self-hosted   (needs >= 120 GB free disk)
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Disabled — vast.ai builds are handled by the main build.yml (Dockerfile.vastai
-# is no longer the active image).  Kept for reference; no triggers are set.
 on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.vastai"
+      - "vllm.conf"
+      - "vllm.sh"
+      - "patch_vllm.py"
+      - ".github/workflows/build-vastai.yml"
   workflow_dispatch:
 
 # Deny all permissions by default; each job grants only what it needs.
@@ -33,38 +38,8 @@ jobs:
     steps:
       - name: Resolve build matrix
         id: matrix
-        env:
-          SELECTED: ${{ github.event.inputs.model }}
         run: |
-          ALL=$(cat <<'EOF'
-          {
-            "include": [
-              {
-                "image_tag": "vllm-nemotron-12b-vl-bf16",
-                "model_id":  "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
-                "latest":    "true",
-                "runner":    "ubuntu-latest"
-              },
-              {
-                "image_tag": "vllm-nemotron-30b-a3b-bf16",
-                "model_id":  "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-                "latest":    "false",
-                "runner":    "self-hosted"
-              }
-            ]
-          }
-          EOF
-          )
-
-          if [ -z "$SELECTED" ] || [ "$SELECTED" = "all" ]; then
-            echo "Building all models"
-            echo "value=$(echo "$ALL" | jq -c .)" >> "$GITHUB_OUTPUT"
-          else
-            echo "Building single model: $SELECTED"
-            FILTERED=$(echo "$ALL" | jq -c --arg tag "$SELECTED" \
-              '{include: [.include[] | select(.image_tag == $tag)]}')
-            echo "value=$FILTERED" >> "$GITHUB_OUTPUT"
-          fi
+          echo 'value={"include":[{"image_tag":"vllm-nemotron-12b-vl-bf16","model_id":"nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16","latest":"true","runner":"ubuntu-latest"}]}' >> "$GITHUB_OUTPUT"
 
 # ── 2. Build each model ────────────────────────────────────────────────────────
 

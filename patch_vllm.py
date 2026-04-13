@@ -10,7 +10,7 @@ of whether EXTRA_COMMANDS runs at instance launch time.
 import glob
 import sys
 
-ROOTS = ['/opt', '/usr', '/root']
+ROOTS = ['/opt', '/usr', '/root', '/venv']
 
 
 def _find(name):
