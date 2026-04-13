@@ -2,9 +2,9 @@ name: Build & push vastai worker image
 
 # ── Supported models ──────────────────────────────────────────────────────────
 #
-#  image_tag                  │ model_id                                        │ weights │ runner
-#  ───────────────────────────┼─────────────────────────────────────────────────┼─────────┼──────────────
-#  vllm-nemotron-12b-vl-bf16  │ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16      │ ~24 GB  │ ubuntu-latest (after disk cleanup)
+#  image_tag    │ model_id                                        │ weights │ runner
+#  ─────────────┼─────────────────────────────────────────────────┼─────────┼──────────────
+#  12b-vl-bf16  │ nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16      │ ~24 GB  │ ubuntu-latest (after disk cleanup)
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -24,7 +24,7 @@ permissions: {}
 
 env:
   REGISTRY:   ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: easedai/nemotron-vastai
 
 # ── 1. Generate matrix ─────────────────────────────────────────────────────────
 
@@ -39,7 +39,7 @@ jobs:
       - name: Resolve build matrix
         id: matrix
         run: |
-          echo 'value={"include":[{"image_tag":"vllm-nemotron-12b-vl-bf16","model_id":"nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16","latest":"true","runner":"ubuntu-latest"}]}' >> "$GITHUB_OUTPUT"
+          echo 'value={"include":[{"image_tag":"12b-vl-bf16","model_id":"nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16","latest":"true","runner":"ubuntu-latest"}]}' >> "$GITHUB_OUTPUT"
 
 # ── 2. Build each model ────────────────────────────────────────────────────────
 
@@ -80,8 +80,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Each model gets a stable vllm-nemotron-* tag plus an immutable SHA tag.
-      # vllm-nemotron-latest tracks the default model (12b-vl-bf16).
+      # Each model gets a stable tag plus an immutable SHA tag.
+      # :latest tracks the default model (12b-vl-bf16).
       - name: Generate image tags
         id: tags
         run: |
@@ -90,7 +90,7 @@ jobs:
           TAG="${{ matrix.image_tag }}"
           TAGS="${BASE}:${TAG},${BASE}:${TAG}-sha-${SHA}"
           if [ "${{ matrix.latest }}" = "true" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            TAGS="${TAGS},${BASE}:vllm-nemotron-latest"
+            TAGS="${TAGS},${BASE}:latest"
           fi
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
           echo "Built tags: $TAGS"
