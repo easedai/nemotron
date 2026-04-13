@@ -212,4 +212,30 @@ _patch(
     'nano_nemotron_vl.py EVS pruning None guard',
 )
 
+# ── Patch 6: chat_completion/protocol.py ─────────────────────────────────────
+# set_include_reasoning_for_none_effort is a Pydantic model_validator(mode="before")
+# that calls data.get("reasoning_effort").  When the request body contains a
+# list-typed "content" field, Pydantic can call the validator with a list, causing
+# AttributeError: 'list' object has no attribute 'get'.
+# Fix: bail out early when data is not a dict.
+_chat_proto = None
+for _r in ROOTS:
+    for _p in glob.glob(_r + '/**/chat_completion/protocol.py', recursive=True):
+        _chat_proto = _p
+        break
+_patch(
+    _chat_proto,
+    (
+        'def set_include_reasoning_for_none_effort(cls, data: Any) -> Any:\n'
+        '        if data.get("reasoning_effort") == "none":\n'
+    ),
+    (
+        'def set_include_reasoning_for_none_effort(cls, data: Any) -> Any:\n'
+        '        if not isinstance(data, dict):\n'
+        '            return data\n'
+        '        if data.get("reasoning_effort") == "none":\n'
+    ),
+    'chat_completion/protocol.py set_include_reasoning_for_none_effort',
+)
+
 print('vLLM patch complete', flush=True)
