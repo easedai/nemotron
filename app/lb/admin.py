@@ -3,20 +3,22 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Security
+from fastapi import APIRouter, Depends, HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from ..config import settings
 from ..event_store import EventStore
-from ..lb_registry import LBRegistry
 from ..models import WorkerStatus
 from ..worker_db import DynamoDB
 
 log = structlog.get_logger(__name__)
 
-router = APIRouter(prefix="/admin", tags=["admin"])
-
+router  = APIRouter(prefix="/admin", tags=["admin"])
 _bearer = HTTPBearer(auto_error=False)
+
+# Module-level singletons that don't touch Redis (created once on import)
+_wdb    = DynamoDB()
+_events = EventStore()
 
 
 def require_admin(
@@ -28,12 +30,6 @@ def require_admin(
             detail="Invalid or missing admin token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-
-
-# Module-level singletons (created once on import)
-_wdb    = DynamoDB()
-_events = EventStore()
-_lb_reg = LBRegistry()
 
 
 # ── Health & fleet status ─────────────────────────────────────────────────────
@@ -54,10 +50,10 @@ async def admin_health():
             return w.bid_price * hrs
         return 0.0
 
-    running   = by_status.get("running",    [])
-    unhealthy = by_status.get("unhealthy",  [])
-    starting  = by_status.get("starting",   [])
-    pending   = by_status.get("pending",    [])
+    running    = by_status.get("running",    [])
+    unhealthy  = by_status.get("unhealthy",  [])
+    starting   = by_status.get("starting",   [])
+    pending    = by_status.get("pending",    [])
     terminated = by_status.get("terminated", [])
 
     active_rate = sum(
@@ -106,7 +102,7 @@ async def admin_health():
 
 @router.get("/workers", dependencies=[Depends(require_admin)])
 async def list_workers():
-    """List all workers and their current state."""
+    """List all workers and their current state from DynamoDB."""
     workers = _wdb.list_workers()
     return {
         "workers": [w.model_dump(mode="json") for w in workers],
@@ -114,17 +110,24 @@ async def list_workers():
     }
 
 
+@router.get("/queue", dependencies=[Depends(require_admin)])
+async def queue_state(request: Request):
+    """Live Redis queue state — available, leased, and draining workers."""
+    queue = request.app.state.queue
+    return await queue.list_state()
+
+
 # ── Terminate ─────────────────────────────────────────────────────────────────
 
 @router.post("/workers/{worker_id}/terminate", dependencies=[Depends(require_admin)])
-async def terminate_worker(worker_id: str):
+async def terminate_worker(worker_id: str, request: Request):
     """
     Destroy a specific worker and remove it from the pool.
 
     Calls the vast.ai API to immediately destroy the instance, marks the
-    worker TERMINATED in DynamoDB, and deregisters it from the LB table.
-    The orchestrator loop will notice the change and handle Discord
-    notifications and bid-floor adjustments on its next reconciliation.
+    worker TERMINATED in DynamoDB, and deregisters it from the Redis queue.
+    If an LB currently holds the lease, the worker is tombstoned so it is
+    dropped after the in-flight request completes.
     """
     worker = _wdb.get_worker(worker_id)
     if not worker:
@@ -146,7 +149,10 @@ async def terminate_worker(worker_id: str):
         )
 
     _wdb.update_worker_status(worker_id, WorkerStatus.TERMINATED)
-    _lb_reg.deregister(worker_id)
+
+    queue = request.app.state.queue
+    await queue.deregister(worker_id)
+
     return {"status": "terminated", "worker_id": worker_id}
 
 

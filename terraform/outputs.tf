@@ -63,6 +63,17 @@ output "authorizer_token_secret_arn" {
   value       = aws_secretsmanager_secret.authorizer_token.arn
 }
 
+output "dynamodb_user_access_key_id" {
+  description = "Access key ID for the DynamoDB IAM user"
+  value       = aws_iam_access_key.dynamodb.id
+}
+
+output "dynamodb_user_secret_access_key" {
+  description = "Secret access key for the DynamoDB IAM user"
+  value       = aws_iam_access_key.dynamodb.secret
+  sensitive   = true
+}
+
 output "vpc_id" {
   description = "VPC ID"
   value       = aws_vpc.main.id

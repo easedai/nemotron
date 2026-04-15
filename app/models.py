@@ -30,11 +30,13 @@ class Worker(BaseModel):
     label:                Optional[str]      = None
     status:               WorkerStatus
     worker_type:          WorkerType
+    provider:             str                = "vastai"
     api_key:              str
     host:                 Optional[str]      = None
     port:                 int                = 8000
     gpu_name:             Optional[str]      = None
     gpu_ram_gb:           Optional[float]    = None
+    num_gpus:             int                = 1
     bid_price:            Optional[float]    = None
     market_price:         Optional[float]    = None
     bid_attempts:         int                = 0
@@ -49,6 +51,8 @@ class Worker(BaseModel):
     @property
     def base_url(self) -> Optional[str]:
         if self.host and self.port:
+            if self.port == 443:
+                return f"https://{self.host}"
             return f"http://{self.host}:{self.port}"
         return None
 
@@ -69,10 +73,13 @@ class LBWorker(BaseModel):
     api_key:     str
     added_at:    datetime
 
+    ssh_port:            Optional[int]      = None
     successful_requests: int = 0
     failed_requests:     int = 0
     last_request_at:     Optional[datetime] = None
 
     @property
     def base_url(self) -> str:
+        if self.port == 443:
+            return f"https://{self.host}"
         return f"http://{self.host}:{self.port}"

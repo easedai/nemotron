@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import httpx
 import structlog
 
@@ -16,17 +18,42 @@ _COLOURS = {
 
 
 class Discord:
-    async def send(self, message: str, level: str = "info") -> None:
+    async def send(
+        self,
+        message: str,
+        level:   str            = "info",
+        title:   Optional[str]  = None,
+        fields:  Optional[list] = None,
+    ) -> None:
+        """
+        Post an embed to the configured Discord webhook.
+
+        Parameters
+        ----------
+        message : str
+            Embed description (markdown supported).
+        level : str
+            Colour key — "info" | "warning" | "error" | "success".
+        title : str, optional
+            Bold title line rendered above the description.
+        fields : list[dict], optional
+            Discord embed fields: ``[{"name": "...", "value": "...", "inline": True}, ...]``
+        """
         # Prefix non-prod replicas so local dev is visually distinct in Discord.
-        if settings.orchestrator_id != "prod":
-            message = f"[{settings.orchestrator_id}] {message}"
-        payload = {
-            "embeds": [{
-                "description": message,
-                "color": _COLOURS.get(level, _COLOURS["info"]),
-            }]
+        prefix = f"[{settings.orchestrator_id}] " if settings.orchestrator_id != "prod" else ""
+
+        embed: dict = {
+            "description": f"{prefix}{message}",
+            "color":       _COLOURS.get(level, _COLOURS["info"]),
         }
-        log.debug("discord.send", level=level, message=message)
+        if title:
+            # Put the env prefix on the title only; description already carries it.
+            embed["title"] = f"{prefix}{title}" if prefix else title
+        if fields:
+            embed["fields"] = fields
+
+        payload = {"embeds": [embed]}
+        log.debug("discord.send", level=level, title=title, message=message)
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(settings.discord_webhook_url, json=payload)

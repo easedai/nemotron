@@ -1,55 +1,106 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import random
+import re
 import secrets
 from datetime import datetime, timezone
 from typing import Optional
 
 import asyncssh
+import boto3
 import httpx
 import structlog
+from botocore.exceptions import ClientError
 
 from ..config import settings
 from ..worker_db import DynamoDB
 from ..event_store import EventStore
+from ..lb_queue import WorkerQueue
 from ..lb_registry import LBRegistry
 from ..models import Worker, WorkerStatus, WorkerType
 from .notifications import Discord
-from .vast_client import VastAIClient
+from .providers import CreateConfig, GPUOffer, GPUProvider, InstanceInfo, get_provider
 
 log = structlog.get_logger(__name__)
 
-# vast.ai instance states that are unrecoverable — worker is gone
-_TERMINAL_STATES = frozenset({"exited", "offline", "deleted", "failed", "inactive"})
 # Consecutive misses required before treating an instance as truly gone
 _MISS_THRESHOLD = 3
-# Keywords in status_msg / cur_state that indicate the instance was preempted by a higher bid
-_OUTBID_KEYWORDS = ("outbid", "preempted", "overbid")
+
+# Seconds between SSH log checks while waiting for vLLM to start.
+_STARTUP_LOG_CHECK_INTERVAL = 60
+
+# Known fatal patterns in vLLM logs that mean the instance will never recover.
+# Order matters — more specific patterns first.
+_FATAL_LOG_PATTERNS: list[tuple[str, str]] = [
+    (
+        r"CUDA out of memory|torch\.OutOfMemoryError",
+        "GPU out of memory — model too large for available VRAM",
+    ),
+    (
+        r"The NVIDIA driver on your system is too old \(found version (\S+)\)",
+        "NVIDIA driver too old for this CUDA build (need driver ≥ 575 for CUDA 13.0)",
+    ),
+    (
+        r"torch\._C\._cuda_init\(\)",
+        "CUDA init failed — driver/CUDA version mismatch",
+    ),
+    (
+        r"Engine core initialization failed|EngineCore failed to start",
+        "vLLM engine core failed to initialize",
+    ),
+    (
+        r"RuntimeError: CUDA error:",
+        "CUDA runtime error during model load",
+    ),
+    (
+        r"No space left on device",
+        "Disk full — insufficient space for model weights",
+    ),
+    (
+        r"No module named '([^']+)'",
+        "Missing Python dependency",
+    ),
+]
 
 
-def _is_outbid(instance: dict) -> bool:
-    """Return True if the vast.ai instance was terminated because of a higher bid."""
-    if not instance:
-        return False
-    haystack = (
-        (instance.get("status_msg") or "")
-        + " "
-        + (instance.get("cur_state") or "")
-    ).lower()
-    return any(kw in haystack for kw in _OUTBID_KEYWORDS)
+def _diagnose_vllm_logs(log_text: str) -> Optional[str]:
+    """
+    Scan vLLM log text for known fatal error patterns.
+
+    Returns a short human-readable diagnosis string (suitable for Discord and the
+    _fail_worker reason), or None if no recognised fatal pattern is found.
+    """
+    for pattern, label in _FATAL_LOG_PATTERNS:
+        m = re.search(pattern, log_text)
+        if m:
+            detail = m.group(1) if m.lastindex else None
+            return f"{label} ({detail})" if detail else label
+    return None
+
+
+def _jitter(base: float, pct: float = 0.20) -> float:
+    """Return *base* ± *pct* fraction so polling never lands on a fixed cadence."""
+    return max(1.0, base * (1 + random.uniform(-pct, pct)))
 
 
 class WorkerManager:
     def __init__(self) -> None:
-        self.db      = DynamoDB()
-        self.vast    = VastAIClient()
-        self.discord = Discord()
-        self.lb      = LBRegistry()
-        self.events  = EventStore()
+        self.db       = DynamoDB()
+        self._providers: dict[str, GPUProvider] = {
+            name: get_provider(name)
+            for name in [p.strip() for p in settings.providers.split(",") if p.strip()]
+        }
+        self.discord  = Discord()
+        self.events   = EventStore()
+        # lb and _queue are initialised in start() after the event loop is running
+        self._queue: Optional[WorkerQueue] = None
+        self.lb:     Optional[LBRegistry]  = None
         self._bidding_task:      Optional[asyncio.Task] = None
         self._monitor_task:      Optional[asyncio.Task] = None
-        self._vast_monitor_task: Optional[asyncio.Task] = None
-        # Consecutive times each worker_id has been missing from vast.ai list.
+        self._provider_monitor_task: Optional[asyncio.Task] = None
+        # Consecutive times each worker_id has been missing from provider list.
         # Only fail the worker once this exceeds _MISS_THRESHOLD.
         self._instance_miss_counts: dict[str, int] = {}
         # Multiplier at which the last bid was won. The next campaign starts one
@@ -64,9 +115,17 @@ class WorkerManager:
         self._ssh_key:        Optional[asyncssh.SSHKey] = None
         self._ssh_public_key: Optional[str] = None
         # Active _wait_for_vllm_health asyncio tasks, keyed by worker_id.
-        # Prevents duplicate tasks from spawning on every _reconcile_state /
-        # _sync_with_vast tick when the same worker is already being polled.
+        # Prevents duplicate tasks from spawning on every reconcile/sync tick
+        # when the same worker is already being polled.
         self._health_check_tasks: dict[str, asyncio.Task] = {}
+        # ── Auto-scaling state ────────────────────────────────────────────────
+        # Rolling window of utilization samples (one per health-check tick).
+        self._utilization_history: list[float] = []
+        # Timestamp of the last scale-up trigger; enforces cooldown between bids.
+        self._last_scale_up_at: Optional[datetime] = None
+        # Consecutive health-check ticks with idle workers; used for scale-down
+        # hysteresis so a single idle sample doesn't immediately kill a worker.
+        self._scale_down_ticks: int = 0
 
     def _ev(
         self,
@@ -88,40 +147,116 @@ class WorkerManager:
             meta=meta,
         )
 
+    # ── Provider helpers ──────────────────────────────────────────────────
+
+    def _provider_for(self, worker: Worker) -> GPUProvider:
+        """Return the loaded GPUProvider that owns this worker."""
+        p = self._providers.get(worker.provider)
+        if p is None:
+            available = ", ".join(repr(k) for k in self._providers)
+            raise RuntimeError(
+                f"No provider loaded for {worker.provider!r} "
+                f"(worker {worker.worker_id}). Loaded: {available}"
+            )
+        return p
+
+    async def _all_instances(self) -> list[InstanceInfo]:
+        """Query every configured provider in parallel and aggregate results."""
+        results: list[InstanceInfo] = []
+        tasks = {
+            name: asyncio.create_task(p.list_instances())
+            for name, p in self._providers.items()
+        }
+        for name, task in tasks.items():
+            try:
+                results.extend(await task)
+            except Exception as exc:
+                log.warning(
+                    "worker_manager.all_instances.provider_failed",
+                    provider=name,
+                    error=str(exc),
+                )
+        return results
+
+    async def _search_all_offers(self, on_demand: bool = False) -> list[GPUOffer]:
+        """Search every configured provider in parallel and return combined offers."""
+        results: list[GPUOffer] = []
+        tasks = {
+            name: asyncio.create_task(p.search_offers(on_demand=on_demand))
+            for name, p in self._providers.items()
+        }
+        for name, task in tasks.items():
+            try:
+                results.extend(await task)
+            except Exception as exc:
+                log.warning(
+                    "worker_manager.search_offers.provider_failed",
+                    provider=name,
+                    error=str(exc),
+                )
+        results.sort(key=lambda o: o.price_per_hr)
+        return results
+
+    def _market_price(self, offers: list[GPUOffer]) -> float:
+        """Median price across all offers (ignoring zero-priced placeholder entries)."""
+        prices = sorted(o.price_per_hr for o in offers if o.price_per_hr > 0)
+        if not prices:
+            return 0.0
+        mid = len(prices) // 2
+        return prices[mid] if len(prices) % 2 else (prices[mid - 1] + prices[mid]) / 2
+
     # ── Startup / shutdown ────────────────────────────────────────────────
 
     async def start(self) -> None:
         log.info("worker_manager.start")
 
-        # Resolve the SSH key pair used to access vast.ai worker instances.
+        # Connect to Redis and wire up the LB registry shim.
+        self._queue = await WorkerQueue.create(
+            settings.redis_url,
+            lease_ttl=settings.redis_lease_ttl_sec,
+        )
+        self.lb = LBRegistry(self._queue)
+
+        # Resolve the SSH key pair used to access GPU worker instances.
         #
-        # ECS deployment: ORCHESTRATOR_SSH_PRIVATE_KEY is injected from Secrets
-        # Manager (ssh_keys.tf / Terraform).  Using a stable key avoids the
-        # "remove old eased-orchestrator keys" scan on every restart and
-        # guarantees the same key survives task restarts.
-        #
-        # Local dev: no env var → generate an ephemeral Ed25519 key.
+        # Priority:
+        #   1. ORCHESTRATOR_SSH_PRIVATE_KEY env var — injected by ECS from
+        #      Secrets Manager (ssh_keys.tf / Terraform).
+        #   2. Fetch directly from AWS Secrets Manager — used for local dev
+        #      where the container has AWS credentials mounted but the env var
+        #      is not pre-populated.
+        #   3. Generate an ephemeral Ed25519 key — last resort fallback; the
+        #      key is not stable across restarts so SSH access won't work until
+        #      the account-level key registration succeeds.
         if settings.orchestrator_ssh_private_key:
             self._ssh_key = asyncssh.import_private_key(
                 settings.orchestrator_ssh_private_key
             )
-            log.info("worker_manager.start.ssh_key_from_secret")
+            log.info("worker_manager.start.ssh_key_from_env")
         else:
-            self._ssh_key = asyncssh.generate_private_key("ssh-ed25519")
-            log.info("worker_manager.start.ssh_key_generated_ephemeral")
+            pem = await asyncio.get_event_loop().run_in_executor(
+                None, self._fetch_ssh_key_from_aws
+            )
+            if pem:
+                self._ssh_key = asyncssh.import_private_key(pem)
+                log.info("worker_manager.start.ssh_key_from_secrets_manager")
+            else:
+                self._ssh_key = asyncssh.generate_private_key("ssh-ed25519")
+                log.info("worker_manager.start.ssh_key_generated_ephemeral")
         raw_pubkey = self._ssh_key.export_public_key("openssh").decode().strip()
         self._ssh_public_key = f"{raw_pubkey} eased-orchestrator"
         log.info("worker_manager.start.ssh_key_ready", pubkey_prefix=raw_pubkey[:40])
-        await self._manage_vast_ssh_keys()
+        await self._manage_ssh_keys()
 
         await self._reconcile_state()
+        await self._sync_redis_queue()
         await self._destroy_zombie_instances()
         await self._post_startup_audit()
         self._monitor_task = asyncio.create_task(
             self._health_monitor_loop(), name="health-monitor"
         )
-        self._vast_monitor_task = asyncio.create_task(
-            self._vast_monitor_loop(), name="vast-monitor"
+        self._provider_monitor_task = asyncio.create_task(
+            self._provider_monitor_loop(), name="provider-monitor"
         )
         await self._ensure_worker()
 
@@ -129,7 +264,7 @@ class WorkerManager:
         log.info("worker_manager.stop")
 
         # Cancel background tasks first so nothing races with the cleanup below
-        for task in (self._bidding_task, self._monitor_task, self._vast_monitor_task):
+        for task in (self._bidding_task, self._monitor_task, self._provider_monitor_task):
             if task and not task.done():
                 task.cancel()
 
@@ -139,21 +274,15 @@ class WorkerManager:
         # down instances on exit would kill workers owned by a sibling replica.
         log.info("worker_manager.stop.skipping_instance_cleanup")
 
-        # Best-effort: remove our SSH key from the vast.ai account
-        if self._ssh_public_key:
-            try:
-                existing = await self.vast.list_ssh_keys()
-                for key in existing:
-                    if "eased-orchestrator" in (key.get("public_key") or ""):
-                        await self.vast.delete_ssh_key(int(key["id"]))
-                        log.info("worker_manager.stop.ssh_key_removed", key_id=key["id"])
-            except Exception as exc:
-                log.warning("worker_manager.stop.ssh_key_removal_failed", error=repr(exc))
+        # The orchestrator SSH key is intentionally NOT removed here — it is
+        # a persistent account-level credential (idempotently registered by
+        # _manage_ssh_keys on startup) that other running orchestrator replicas
+        # and already-launched instances still rely on.
 
     async def _destroy_all_instances(self) -> None:
         """
-        Destroy every vast.ai instance we own (active workers + debug instances
-        kept alive by keep_debug_instance) and update their DB status to TERMINATED.
+        Destroy every instance we own (active workers + debug instances kept alive by
+        keep_debug_instance) and update their DB status to TERMINATED.
 
         Runs concurrently so multiple instances are torn down in parallel.
         destroy_instance handles 404 gracefully, so already-gone instances are safe.
@@ -180,7 +309,7 @@ class WorkerManager:
                 status=worker.status,
             )
             try:
-                await self.vast.destroy_instance(worker.instance_id)
+                await self._provider_for(worker).destroy_instance(worker.instance_id)
                 self.db.delete_worker(worker.worker_id)
             except Exception as exc:
                 log.error(
@@ -209,11 +338,39 @@ class WorkerManager:
         )
         return chosen
 
+    # ── Redis queue sync ──────────────────────────────────────────────────
+
+    async def _sync_redis_queue(self) -> None:
+        """
+        Reconcile the Redis worker queue against DynamoDB after startup.
+
+        Called after _reconcile_state() so that DynamoDB is already the
+        authoritative source of truth.  Any worker that is RUNNING in DynamoDB
+        but absent from Redis is re-registered; any worker in Redis that is no
+        longer RUNNING in DynamoDB is deregistered.
+
+        All discrepancies are logged at WARNING level so they are visible in
+        production monitoring.
+        """
+        if self._queue is None:
+            log.error("worker_manager.sync_redis.queue_not_ready")
+            return
+        running_workers = self.db.get_active_workers()
+        result = await self._queue.sync(running_workers)
+        if result["added"] or result["removed"]:
+            log.warning(
+                "worker_manager.sync_redis.repaired",
+                added=result["added"],
+                removed=result["removed"],
+            )
+        else:
+            log.info("worker_manager.sync_redis.ok")
+
     # ── State reconciliation ──────────────────────────────────────────────
 
     async def _reconcile_state(self) -> None:
         """
-        On startup, cross-check DynamoDB records against live vast.ai instances.
+        On startup, cross-check DynamoDB records against live provider instances.
         Repairs stale state left by a previous orchestrator crash or restart.
         Workers still pending have their _wait_for_running task resumed.
         """
@@ -224,9 +381,8 @@ class WorkerManager:
             return
 
         try:
-            live_instances = {
-                str(i["id"]): i for i in await self.vast.list_instances()
-            }
+            instances    = await self._all_instances()
+            live         = {i.instance_id: i for i in instances}
         except Exception as exc:
             log.error("worker_manager.reconcile.list_failed", error=str(exc))
             return
@@ -234,40 +390,43 @@ class WorkerManager:
         log.info(
             "worker_manager.reconcile",
             db_workers=len(db_workers),
-            live_instances=len(live_instances),
+            live_instances=len(live),
         )
 
         for worker in db_workers:
             if not worker.instance_id:
                 continue
 
-            live = live_instances.get(str(worker.instance_id))
-            if not live:
+            instance = live.get(worker.instance_id)
+            if not instance:
                 log.warning(
                     "worker_manager.reconcile.instance_gone",
                     worker_id=worker.worker_id,
                     instance_id=worker.instance_id,
+                    db_status=worker.status,
                 )
-                self.db.delete_worker(worker.worker_id)
+                # Route through _fail_worker so the LB entry is deregistered,
+                # an event is recorded, Discord is notified, and a new bid
+                # campaign is started if no workers remain.
+                await self._fail_worker(
+                    worker,
+                    reason="instance not found on provider during startup reconciliation",
+                )
                 continue
 
-            actual     = live.get("actual_status", "unknown")
-            cur_state  = live.get("cur_state", "")
-            status_msg = live.get("status_msg", "")
             log.info(
                 "worker_manager.reconcile.instance",
                 worker_id=worker.worker_id,
                 instance_id=worker.instance_id,
-                actual_status=actual,
-                cur_state=cur_state,
-                status_msg=status_msg,
+                actual_status=instance.actual_status,
+                cur_state=instance.cur_state,
+                status_msg=instance.status_msg,
                 db_status=worker.status,
             )
 
-            if actual == "running":
-                addr = self.vast.extract_worker_address(live)
-                if addr:
-                    host, port = addr
+            if instance.actual_status == "running":
+                if instance.host:
+                    host, port = instance.host, instance.port
                     if worker.status == WorkerStatus.RUNNING:
                         # Already verified before — just refresh host/port in case they changed
                         self.db.update_worker_status(
@@ -277,8 +436,7 @@ class WorkerManager:
                             port=port,
                         )
                         # Re-register in LB (idempotent — preserves accumulated stats)
-                        # in case the LB table entry was lost while we were offline.
-                        self.lb.register(worker.worker_id, "vastai", host, port, worker.api_key)
+                        await self.lb.register(worker.worker_id, worker.provider, host, port, worker.api_key, ssh_port=instance.ssh_port)
                     else:
                         # Instance is up but vLLM hasn't been health-checked yet
                         log.info(
@@ -298,16 +456,17 @@ class WorkerManager:
                             host=host,
                             port=port,
                             api_key=worker.api_key,
+                            provider_name=worker.provider,
+                            ssh_port=instance.ssh_port,
                         )
-            elif actual in _TERMINAL_STATES:
+            elif instance.is_terminal:
                 # Route through _fail_worker so outbid instances increment
                 # _preemption_count, send a Discord alert, and raise the bid
-                # floor for the next campaign — same path as _sync_with_vast.
-                outbid = _is_outbid(live)
+                # floor for the next campaign.
                 reason = (
-                    f"outbid: {status_msg}"
-                    if outbid
-                    else f"vast.ai reports {actual!r} on startup: {status_msg}"
+                    f"outbid: {instance.status_msg}"
+                    if instance.is_outbid
+                    else f"provider reports {instance.actual_status!r} on startup: {instance.status_msg}"
                 )
                 await self._fail_worker(worker, reason=reason)
             elif worker.status in (WorkerStatus.PENDING, WorkerStatus.STARTING):
@@ -315,7 +474,7 @@ class WorkerManager:
                 log.info(
                     "worker_manager.reconcile.resuming_wait",
                     worker_id=worker.worker_id,
-                    actual_status=actual,
+                    actual_status=instance.actual_status,
                 )
                 asyncio.create_task(
                     self._wait_for_running(worker),
@@ -326,7 +485,7 @@ class WorkerManager:
 
     async def _destroy_zombie_instances(self) -> None:
         """
-        Destroy any vast.ai instances we own that have no DynamoDB record.
+        Destroy any provider instances we own that have no DynamoDB record.
 
         _reconcile_state() runs first, so any instance the DB already knows
         about is handled.  Anything left with our label/image is a zombie from
@@ -335,33 +494,30 @@ class WorkerManager:
         """
         log.info("worker_manager.destroy_zombies.start")
         try:
-            all_instances = await self.vast.list_instances()
+            all_instances = await self._all_instances()
         except Exception as exc:
             log.error("worker_manager.destroy_zombies.list_failed", error=str(exc))
             return
 
         known_ids   = self.db.get_known_instance_ids()
         ghcr_prefix = "ghcr.io/easedai/"
-        zombies: list[dict] = []
+        zombies: list[InstanceInfo] = []
 
         for instance in all_instances:
-            iid = str(instance.get("id", ""))
-            if not iid or iid in known_ids:
+            if not instance.instance_id or instance.instance_id in known_ids:
                 continue
-            label  = instance.get("label", "") or ""
-            image  = instance.get("image", "") or ""
-            if not (label.startswith("eased-") or ghcr_prefix in image):
+            if not (instance.label.startswith("eased-") or ghcr_prefix in instance.image):
                 continue
-            if instance.get("actual_status", "") in _TERMINAL_STATES:
+            if instance.is_terminal:
                 continue  # already dead
 
             zombies.append(instance)
             log.warning(
                 "worker_manager.destroy_zombies.found",
-                instance_id=iid,
-                label=label,
-                actual_status=instance.get("actual_status"),
-                gpu=instance.get("gpu_name"),
+                instance_id=instance.instance_id,
+                label=instance.label,
+                actual_status=instance.actual_status,
+                gpu=instance.gpu_name,
             )
 
         if not zombies:
@@ -371,21 +527,25 @@ class WorkerManager:
         lines = [f"**Startup cleanup — {len(zombies)} zombie instance(s) destroyed**"]
         for z in zombies:
             lines.append(
-                f"  • `{z.get('id')}` — `{z.get('gpu_name', '?')}` "
-                f"status `{z.get('actual_status', '?')}` "
-                f"label `{z.get('label', '?')}`"
+                f"  • `{z.instance_id}` — `{z.gpu_name or '?'}` "
+                f"status `{z.actual_status}` "
+                f"label `{z.label or '?'}`"
             )
         await self.discord.send("\n".join(lines), "warning")
 
         for zombie in zombies:
-            iid = str(zombie.get("id", ""))
+            prov = self._providers.get(zombie.provider)
+            if not prov:
+                log.warning("worker_manager.destroy_zombies.unknown_provider",
+                            instance_id=zombie.instance_id, provider=zombie.provider)
+                continue
             try:
-                await self.vast.destroy_instance(iid)
-                log.info("worker_manager.destroy_zombies.destroyed", instance_id=iid)
+                await prov.destroy_instance(zombie.instance_id)
+                log.info("worker_manager.destroy_zombies.destroyed", instance_id=zombie.instance_id)
             except Exception as exc:
                 log.error(
                     "worker_manager.destroy_zombies.destroy_failed",
-                    instance_id=iid,
+                    instance_id=zombie.instance_id,
                     error=repr(exc),
                 )
 
@@ -394,10 +554,10 @@ class WorkerManager:
     # ── Startup audit ─────────────────────────────────────────────────────
 
     async def _post_startup_audit(self) -> None:
-        """Post a one-time Discord summary of DB + vast.ai state after startup reconciliation."""
+        """Post a one-time Discord summary of DB + provider state after startup reconciliation."""
         try:
             db_workers    = self.db.list_workers()
-            all_instances = await self.vast.list_instances()
+            all_instances = await self._all_instances()
         except Exception as exc:
             log.warning("worker_manager.startup_audit.failed", error=str(exc))
             return
@@ -409,14 +569,13 @@ class WorkerManager:
         ghcr_prefix = "ghcr.io/easedai/"
         our_instances = [
             i for i in all_instances
-            if (i.get("label", "") or "").startswith("eased-")
-            or ghcr_prefix in (i.get("image", "") or "")
+            if i.label.startswith("eased-") or ghcr_prefix in i.image
         ]
 
         log.info(
             "worker_manager.startup_audit",
             db_workers=len(db_workers),
-            our_vast_instances=len(our_instances),
+            our_instances=len(our_instances),
             by_status=by_status,
         )
 
@@ -424,12 +583,12 @@ class WorkerManager:
         lines = [
             "**Orchestrator started**",
             f"DB workers: **{len(db_workers)}** ({status_parts})",
-            f"vast.ai instances (ours): **{len(our_instances)}**",
+            f"Provider instances (ours): **{len(our_instances)}**",
         ]
         for inst in our_instances:
             lines.append(
-                f"  • `{inst.get('id')}` — `{inst.get('gpu_name', '?')}` "
-                f"`{inst.get('actual_status', '?')}` label `{inst.get('label', '?')}`"
+                f"  • `{inst.instance_id}` — `{inst.gpu_name or '?'}` "
+                f"`{inst.actual_status}` label `{inst.label or '?'}`"
             )
         await self.discord.send("\n".join(lines), "info")
 
@@ -454,10 +613,10 @@ class WorkerManager:
 
     async def _bidding_campaign(self) -> None:
         """
-        Bid for a cheap interruptible GPU instance on vast.ai.
+        Bid for a cheap interruptible GPU instance.
 
         Strategy:
-          • Start at bid_start_pct  (default 70 %) of median market price
+          • Start at bid_start_pct  (default 50 %) of median market price
           • Every bid_retry_interval_sec (default 5 min) increase by bid_step_pct (5 %)
           • Give up and fall back to on-demand once bid_max_multiplier (110 %) is exceeded
         """
@@ -473,27 +632,27 @@ class WorkerManager:
             else ""
         )
         await self.discord.send(
-            f"**Bid campaign started** — searching for a cheap GPU worker on vast.ai.{preemption_note}",
+            f"**Bid campaign started** — searching for a cheap GPU worker.{preemption_note}",
             "info",
         )
 
         try:
-            offers = await self.vast.search_offers(on_demand=False)
+            offers = await self._search_all_offers(on_demand=False)
         except Exception as exc:
             log.error("worker_manager.bid_campaign.search_failed", error=str(exc))
-            await self.discord.send(f"vast.ai offer search failed: `{exc}`", "error")
+            await self.discord.send(f"Offer search failed: `{exc}`", "error")
             return
 
         if not offers:
             log.error("worker_manager.bid_campaign.no_offers")
             await self.discord.send(
-                "No interruptible GPU offers found on vast.ai. Falling back to on-demand.",
+                "No interruptible GPU offers found. Falling back to on-demand.",
                 "warning",
             )
             await self._launch_on_demand()
             return
 
-        market_price   = self.vast.get_market_price(offers)
+        market_price   = self._market_price(offers)
         worker_api_key = secrets.token_urlsafe(32)
         attempt        = 0
 
@@ -542,12 +701,12 @@ class WorkerManager:
             bid_price = round(market_price * multiplier, 6)
 
             # Pick the cheapest offer our bid can beat
-            best_offer = next(
-                (o for o in offers if o.get("dph_base", float("inf")) <= bid_price),
+            best_offer: Optional[GPUOffer] = next(
+                (o for o in offers if o.price_per_hr <= bid_price),
                 None,
             )
             if not best_offer:
-                cheapest = offers[0].get("dph_base") if offers else None
+                cheapest = offers[0].price_per_hr if offers else None
                 log.info(
                     "worker_manager.bid_campaign.no_match",
                     attempt=attempt + 1,
@@ -562,12 +721,12 @@ class WorkerManager:
                     f"Retrying in {settings.bid_retry_interval_sec // 60} min.",
                     "info",
                 )
-                await asyncio.sleep(settings.bid_retry_interval_sec)
+                await asyncio.sleep(_jitter(settings.bid_retry_interval_sec))
                 attempt += 1
                 # Refresh offers after the wait — prices shift between retries
                 try:
-                    offers       = await self.vast.search_offers(on_demand=False)
-                    market_price = self.vast.get_market_price(offers)
+                    offers       = await self._search_all_offers(on_demand=False)
+                    market_price = self._market_price(offers)
                 except Exception as exc:
                     log.warning("worker_manager.bid_campaign.refresh_failed", error=str(exc))
                 continue
@@ -577,36 +736,39 @@ class WorkerManager:
             log.info(
                 "worker_manager.bid_campaign.placing",
                 attempt=attempt + 1,
-                offer_id=best_offer["id"],
+                offer_id=best_offer.offer_id,
                 bid_price=bid_price,
-                gpu=best_offer.get("gpu_name"),
-                gpu_ram_gb=round(best_offer.get("gpu_ram", 0) / 1024, 1),
+                gpu=best_offer.gpu_name,
+                gpu_ram_gb=best_offer.gpu_ram_gb,
                 label=label,
             )
 
             try:
-                result = await self.vast.create_instance(
-                    offer_id=best_offer["id"],
-                    price=bid_price,
+                config = CreateConfig(
                     worker_api_key=worker_api_key,
-                    worker_type=WorkerType.INTERRUPTIBLE,
+                    on_demand=False,
                     label=label,
+                    price=bid_price,
                     ssh_public_key=self._ssh_public_key,
                 )
-                instance_id = str(
-                    result.get("new_contract") or result.get("id") or ""
-                )
-                if not instance_id:
-                    raise ValueError(f"No instance ID in response: {result}")
+                instance_id = await self._providers[best_offer.provider].create_instance(best_offer, config)
             except Exception as exc:
                 log.error(
                     "worker_manager.bid_campaign.create_failed",
                     attempt=attempt + 1,
                     error=str(exc),
                 )
-                await asyncio.sleep(settings.bid_retry_interval_sec)
+                await asyncio.sleep(_jitter(settings.bid_retry_interval_sec))
                 attempt += 1
                 continue
+
+            # Attach the SSH key via vast.ai's per-instance endpoint as a
+            # second, reliable injection channel.  EXTRA_COMMANDS also injects
+            # the key into authorized_keys at launch, but vast.ai has been
+            # observed to drop EXTRA_COMMANDS on some hosts — this call closes
+            # that gap.  Best-effort: a failure here is not fatal since the
+            # launch-time injection may still have succeeded.
+            await self._attach_ssh_key_best_effort(instance_id, best_offer.provider)
 
             now = datetime.now(timezone.utc)
             worker = Worker(
@@ -615,13 +777,15 @@ class WorkerManager:
                 label=label,
                 status=WorkerStatus.PENDING,
                 worker_type=WorkerType.INTERRUPTIBLE,
+                provider=best_offer.provider,
                 api_key=worker_api_key,
-                gpu_name=best_offer.get("gpu_name"),
-                gpu_ram_gb=round(best_offer.get("gpu_ram", 0) / 1024, 1),
+                gpu_name=best_offer.gpu_name,
+                gpu_ram_gb=best_offer.gpu_ram_gb,
+                num_gpus=best_offer.num_gpus,
                 bid_price=bid_price,
                 market_price=market_price,
                 bid_attempts=attempt + 1,
-                specs=self.vast.extract_instance_specs(best_offer),
+                specs=best_offer.specs,
                 image_pull_started_at=now,
                 created_at=now,
                 updated_at=now,
@@ -629,11 +793,11 @@ class WorkerManager:
             self.db.save_worker(worker)
             self._ev(
                 worker, "worker.created",
-                f"Bid accepted — {best_offer.get('gpu_name')} "
+                f"Bid accepted — {best_offer.gpu_name} "
                 f"at ${bid_price:.4f}/hr ({multiplier:.0%} of market), instance {instance_id}",
                 meta={"bid_price": bid_price, "market_price": market_price,
-                      "attempt": attempt + 1, "gpu": best_offer.get("gpu_name"),
-                      "offer_id": best_offer["id"]},
+                      "attempt": attempt + 1, "gpu": best_offer.gpu_name,
+                      "offer_id": best_offer.offer_id},
             )
 
             self._last_winning_multiplier = multiplier
@@ -643,11 +807,16 @@ class WorkerManager:
                 instance_id=instance_id,
                 bid_price=bid_price,
                 multiplier=f"{multiplier:.0%}",
-                gpu=best_offer.get("gpu_name"),
+                gpu=best_offer.gpu_name,
+            )
+            gpu_desc = (
+                f"{best_offer.num_gpus}×{best_offer.gpu_name} "
+                f"({best_offer.total_gpu_ram_gb:.0f} GB total, TP={best_offer.num_gpus})"
+                if best_offer.num_gpus > 1
+                else f"{best_offer.gpu_name} ({best_offer.gpu_ram_gb} GB)"
             )
             await self.discord.send(
-                f"**Bid accepted** — `{best_offer.get('gpu_name')}` "
-                f"({round(best_offer.get('gpu_ram', 0) / 1024, 1)} GB VRAM) "
+                f"**Bid accepted** — `{gpu_desc}` "
                 f"at **${bid_price:.4f}/hr** ({multiplier:.0%} of market).\n"
                 f"Instance `{instance_id}` is pending — monitoring until ready.",
                 "success",
@@ -666,7 +835,7 @@ class WorkerManager:
             "warning",
         )
         try:
-            offers = await self.vast.search_offers(on_demand=True)
+            offers = await self._search_all_offers(on_demand=True)
         except Exception as exc:
             log.error("worker_manager.on_demand.search_failed", error=str(exc))
             await self.discord.send(f"On-demand search failed: `{exc}`", "error")
@@ -684,28 +853,28 @@ class WorkerManager:
 
         log.info(
             "worker_manager.on_demand.creating",
-            offer_id=best["id"],
-            price=best.get("dph_base"),
-            gpu=best.get("gpu_name"),
+            offer_id=best.offer_id,
+            price=best.price_per_hr,
+            gpu=best.gpu_name,
             label=label,
         )
 
         try:
-            result = await self.vast.create_instance(
-                offer_id=best["id"],
-                price=best["dph_base"],
+            config = CreateConfig(
                 worker_api_key=worker_api_key,
-                worker_type=WorkerType.ON_DEMAND,
+                on_demand=True,
                 label=label,
+                price=best.price_per_hr,
                 ssh_public_key=self._ssh_public_key,
             )
-            instance_id = str(result.get("new_contract") or result.get("id") or "")
-            if not instance_id:
-                raise ValueError(f"No instance ID in response: {result}")
+            instance_id = await self._providers[best.provider].create_instance(best, config)
         except Exception as exc:
             log.error("worker_manager.on_demand.create_failed", error=str(exc))
             await self.discord.send(f"On-demand launch failed: `{exc}`", "error")
             return
+
+        # Second injection channel — see note in _bid_campaign.
+        await self._attach_ssh_key_best_effort(instance_id, best.provider)
 
         now = datetime.now(timezone.utc)
         worker = Worker(
@@ -714,12 +883,14 @@ class WorkerManager:
             label=label,
             status=WorkerStatus.PENDING,
             worker_type=WorkerType.ON_DEMAND,
+            provider=best.provider,
             api_key=worker_api_key,
-            gpu_name=best.get("gpu_name"),
-            gpu_ram_gb=round(best.get("gpu_ram", 0) / 1024, 1),
-            bid_price=best.get("dph_base"),
-            market_price=best.get("dph_base"),
-            specs=self.vast.extract_instance_specs(best),
+            gpu_name=best.gpu_name,
+            gpu_ram_gb=best.gpu_ram_gb,
+            num_gpus=best.num_gpus,
+            bid_price=best.price_per_hr,
+            market_price=best.price_per_hr,
+            specs=best.specs,
             image_pull_started_at=now,
             created_at=now,
             updated_at=now,
@@ -727,15 +898,21 @@ class WorkerManager:
         self.db.save_worker(worker)
         self._ev(
             worker, "worker.created",
-            f"On-demand instance created — {best.get('gpu_name')} "
-            f"at ${best.get('dph_base', 0):.4f}/hr, instance {instance_id}",
-            meta={"price": best.get("dph_base"), "gpu": best.get("gpu_name"),
-                  "offer_id": best["id"]},
+            f"On-demand instance created — {best.gpu_name} "
+            f"at ${best.price_per_hr:.4f}/hr, instance {instance_id}",
+            meta={"price": best.price_per_hr, "gpu": best.gpu_name,
+                  "offer_id": best.offer_id},
         )
 
+        gpu_desc = (
+            f"{best.num_gpus}×{best.gpu_name} "
+            f"({best.total_gpu_ram_gb:.0f} GB total, TP={best.num_gpus})"
+            if best.num_gpus > 1
+            else f"{best.gpu_name} ({best.gpu_ram_gb} GB)"
+        )
         await self.discord.send(
-            f"**On-demand instance created** — `{best.get('gpu_name')}` "
-            f"at **${best.get('dph_base', 0):.4f}/hr**. Instance `{instance_id}`.",
+            f"**On-demand instance created** — `{gpu_desc}` "
+            f"at **${best.price_per_hr:.4f}/hr**. Instance `{instance_id}`.",
             "warning",
         )
         await self._wait_for_running(worker)
@@ -744,7 +921,7 @@ class WorkerManager:
 
     async def _wait_for_running(self, worker: Worker) -> None:
         """
-        Poll vast.ai every 15 s until the instance reaches `running` status,
+        Poll the provider every 15 s until the instance reaches `running` status,
         then hand off to _wait_for_vllm_health.
 
         Logs cur_state / status_msg on every tick so failures are visible in logs.
@@ -760,15 +937,15 @@ class WorkerManager:
         deadline = loop.time() + settings.instance_running_timeout_sec
         consecutive_errors = 0
         miss_count = 0
-        # Tracks whether we have ever seen this instance in the vast.ai API.
+        # Tracks whether we have ever seen this instance in the provider API.
         # Before the first confirmation we do NOT count misses as failures —
         # the API can take 30-60 s to propagate a freshly created instance.
         instance_ever_seen = False
 
         while loop.time() < deadline:
-            await asyncio.sleep(15)
+            await asyncio.sleep(_jitter(15))
             try:
-                instance = await self.vast.get_instance(worker.instance_id)
+                instance = await self._provider_for(worker).get_instance(worker.instance_id)
             except Exception as exc:
                 log.warning(
                     "worker_manager.wait_for_running.poll_error",
@@ -809,7 +986,7 @@ class WorkerManager:
                 logs = await self._fetch_worker_logs(worker.instance_id, worker=worker, trigger="instance_gone")
                 await self._fail_worker(
                     worker,
-                    reason="instance disappeared from vast.ai",
+                    reason="instance disappeared from provider",
                     logs=logs,
                 )
                 return
@@ -817,47 +994,42 @@ class WorkerManager:
             instance_ever_seen = True
             miss_count = 0  # confirmed alive — reset
 
-            actual     = instance.get("actual_status", "unknown")
-            cur_state  = instance.get("cur_state", "")
-            status_msg = instance.get("status_msg", "") or ""
-            next_state = instance.get("next_state", "")
-            elapsed    = round(loop.time() - (deadline - settings.instance_running_timeout_sec))
+            elapsed = round(loop.time() - (deadline - settings.instance_running_timeout_sec))
 
             log.info(
                 "worker_manager.wait_for_running.poll",
                 worker_id=worker.worker_id,
-                actual_status=actual,
-                cur_state=cur_state,
-                status_msg=status_msg,
-                next_state=next_state,
+                actual_status=instance.actual_status,
+                cur_state=instance.cur_state,
+                status_msg=instance.status_msg,
+                next_state=instance.next_state,
                 elapsed_sec=elapsed,
             )
 
             # Detect repeated Docker pull / image errors in status_msg — fail fast
             # rather than waiting for the full startup timeout.
-            if status_msg.lower().startswith("error"):
+            if instance.status_msg.lower().startswith("error"):
                 consecutive_errors += 1
                 log.warning(
                     "worker_manager.wait_for_running.status_msg_error",
                     worker_id=worker.worker_id,
-                    status_msg=status_msg,
+                    status_msg=instance.status_msg,
                     consecutive_errors=consecutive_errors,
                 )
                 if consecutive_errors >= 3:
                     logs = await self._fetch_worker_logs(worker.instance_id, worker=worker, trigger="status_msg_error")
                     await self._fail_worker(
                         worker,
-                        reason=f"repeated error in vast.ai status: {status_msg}",
+                        reason=f"repeated error in provider status: {instance.status_msg}",
                         logs=logs,
                     )
                     return
             else:
                 consecutive_errors = 0
 
-            if actual == "running":
-                addr = self.vast.extract_worker_address(instance)
-                if addr:
-                    host, port = addr
+            if instance.actual_status == "running":
+                if instance.host:
+                    host, port = instance.host, instance.port
 
                     # ── Image pull duration ───────────────────────────────
                     pull_duration: Optional[float] = None
@@ -886,11 +1058,11 @@ class WorkerManager:
                         event_type="status.changed",
                         status=WorkerStatus.STARTING.value,
                         prev_status=worker.status.value,
-                        message=f"vast.ai instance running — waiting for vLLM health at {host}:{port}",
+                        message=f"Provider instance running — waiting for vLLM health at {host}:{port}",
                         instance_id=worker.instance_id,
                         label=worker.label,
                         meta={"host": host, "port": port,
-                              "cur_state": cur_state, "elapsed_sec": elapsed,
+                              "cur_state": instance.cur_state, "elapsed_sec": elapsed,
                               "image_pull_duration_sec": pull_duration},
                     )
                     pull_note = (
@@ -906,11 +1078,22 @@ class WorkerManager:
                         f"{settings.worker_startup_timeout_sec // 60} min).",
                         "info",
                     )
+                    # vast.ai silently drops our Docker -e env dict and
+                    # EXTRA_COMMANDS on many hosts, so we can't rely on the API
+                    # to inject VLLM_API_KEY / TENSOR_PARALLEL_SIZE / etc.
+                    # Instead, SSH in once the container is up, write
+                    # /etc/vllm-env.sh, and restart vllm so it picks up our
+                    # config.  If SSH isn't ready yet, the health-check loop
+                    # will retry the inject on each periodic SSH check interval.
+                    inject_ok = await self._ssh_inject_env_and_restart_vllm(instance, worker)
                     self._spawn_vllm_health_task(
                         worker_id=worker.worker_id,
                         host=host,
                         port=port,
                         api_key=worker.api_key,
+                        provider_name=worker.provider,
+                        ssh_port=instance.ssh_port,
+                        ssh_inject_done=inject_ok,
                     )
                     return
                 else:
@@ -921,21 +1104,20 @@ class WorkerManager:
                         worker_id=worker.worker_id,
                         instance_id=worker.instance_id,
                         elapsed_sec=elapsed,
-                        ports=instance.get("ports"),
                     )
 
-            elif actual in _TERMINAL_STATES:
+            elif instance.is_terminal:
                 log.error(
                     "worker_manager.wait_for_running.terminal_state",
                     worker_id=worker.worker_id,
-                    actual_status=actual,
-                    cur_state=cur_state,
-                    status_msg=status_msg,
+                    actual_status=instance.actual_status,
+                    cur_state=instance.cur_state,
+                    status_msg=instance.status_msg,
                 )
                 logs = await self._fetch_worker_logs(worker.instance_id, worker=worker, trigger="terminal_state")
                 await self._fail_worker(
                     worker,
-                    reason=f"vast.ai status=`{actual}` cur_state=`{cur_state}` — {status_msg}",
+                    reason=f"provider status=`{instance.actual_status}` cur_state=`{instance.cur_state}` — {instance.status_msg}",
                     logs=logs,
                 )
                 return
@@ -959,11 +1141,21 @@ class WorkerManager:
         host: str,
         port: int,
         api_key: str,
+        provider_name: str = "vastai",
+        ssh_port: Optional[int] = None,
+        ssh_inject_done: bool = False,
     ) -> None:
         """
         Start a _wait_for_vllm_health task for *worker_id* if one is not already
         running.  Stores the task in self._health_check_tasks and registers a
         done-callback that removes it so the slot is freed when the task exits.
+
+        *ssh_inject_done* should be True when the caller already successfully
+        injected /etc/vllm-env.sh (via _ssh_inject_env_and_restart_vllm) before
+        spawning this task.  When False, the health loop will retry the injection
+        periodically until it succeeds — this covers the case where SSH was not yet
+        available when the instance first came up, as well as orchestrator restarts
+        where the inject was never attempted.
         """
         existing = self._health_check_tasks.get(worker_id)
         if existing and not existing.done():
@@ -978,6 +1170,9 @@ class WorkerManager:
                 host=host,
                 port=port,
                 api_key=api_key,
+                provider_name=provider_name,
+                ssh_port=ssh_port,
+                ssh_inject_done=ssh_inject_done,
             ),
             name=f"vllm-health-{worker_id}",
         )
@@ -998,17 +1193,28 @@ class WorkerManager:
         host: str,
         port: int,
         api_key: str,
+        provider_name: str = "vastai",
+        ssh_port: Optional[int] = None,
+        ssh_inject_done: bool = False,
     ) -> None:
         """
         Poll the worker's /health endpoint until vLLM responds 200.
 
-        vast.ai is treated as ground truth: on every iteration we also check
+        The provider is treated as ground truth: on every iteration we also check
         the instance status.  If it is gone or in a terminal state we fail
         immediately instead of waiting out the full startup timeout.
+
+        If *ssh_inject_done* is False, the loop will attempt to SSH-inject
+        /etc/vllm-env.sh (including TENSOR_PARALLEL_SIZE) on each periodic SSH
+        check interval until the inject succeeds.  This provides fault-tolerant
+        multi-GPU configuration: even if SSH wasn't ready when the instance first
+        came up, or the orchestrator restarted after the container was already
+        running, vLLM will eventually receive the correct env and be restarted.
         """
         url  = f"http://{host}:{port}/health"
         loop = asyncio.get_event_loop()
         deadline = loop.time() + settings.worker_startup_timeout_sec
+        _ssh_inject_done = ssh_inject_done  # mutable local copy
 
         log.info(
             "worker_manager.wait_for_vllm_health.start",
@@ -1018,30 +1224,32 @@ class WorkerManager:
         )
 
         vast_miss_count = 0
+        last_log_check  = loop.time()  # SSH log check cadence
 
         while loop.time() < deadline:
-            # ── 1. Check vast.ai first — ground truth ────────────────────
+            # ── 1. Check provider first — ground truth ────────────────────
             worker = self.db.get_worker(worker_id)
             if worker and worker.instance_id:
                 try:
-                    instance = await self.vast.get_instance(worker.instance_id)
-                    actual   = instance.get("actual_status", "") if instance else ""
+                    prov = self._providers.get(provider_name) or self._providers.get(worker.provider)
+                    instance = await prov.get_instance(worker.instance_id) if prov else None
+                    gone = not instance or instance.is_terminal
 
-                    if not instance or actual in _TERMINAL_STATES:
+                    if gone:
                         vast_miss_count += 1
                         log.warning(
                             "worker_manager.wait_for_vllm_health.instance_gone",
                             worker_id=worker_id,
                             instance_id=worker.instance_id,
-                            actual_status=actual,
+                            actual_status=instance.actual_status if instance else "missing",
                             consecutive_misses=vast_miss_count,
                             threshold=_MISS_THRESHOLD,
                         )
                         if vast_miss_count >= _MISS_THRESHOLD:
                             reason = (
-                                "vast.ai instance gone (no record)"
+                                "provider instance gone (no record)"
                                 if not instance
-                                else f"vast.ai status={actual!r}"
+                                else f"provider status={instance.actual_status!r}"
                             )
                             logs = await self._fetch_worker_logs(
                                 worker.instance_id, worker=worker, trigger="instance_gone_during_health"
@@ -1052,80 +1260,151 @@ class WorkerManager:
                         vast_miss_count = 0  # instance confirmed alive — reset
                 except Exception as exc:
                     log.debug(
-                        "worker_manager.wait_for_vllm_health.vast_check_failed",
+                        "worker_manager.wait_for_vllm_health.provider_check_failed",
                         worker_id=worker_id,
                         error=str(exc),
                     )
 
-            # ── 2. Ping vLLM ─────────────────────────────────────────────
+            # ── 2. Periodic SSH log check + inject retry ──────────────────
+            if (
+                self._ssh_key is not None
+                and ssh_port is not None
+                and (loop.time() - last_log_check) >= _STARTUP_LOG_CHECK_INTERVAL
+            ):
+                last_log_check = loop.time()
+                worker = self.db.get_worker(worker_id)
+                if worker and worker.instance_id:
+                    try:
+                        prov2 = self._providers.get(provider_name) or self._providers.get(worker.provider)
+                        instance = await prov2.get_instance(worker.instance_id) if prov2 else None
+                        if instance:
+                            # Retry SSH env inject until it succeeds.  This is the
+                            # fault-tolerant multi-GPU path: if SSH wasn't ready when
+                            # the container first came up, or the orchestrator
+                            # restarted after the instance was already running, we
+                            # re-inject /etc/vllm-env.sh (with TENSOR_PARALLEL_SIZE)
+                            # and kick supervisord so vLLM starts with the right config.
+                            if not _ssh_inject_done:
+                                ok = await self._ssh_inject_env_and_restart_vllm(instance, worker)
+                                if ok:
+                                    _ssh_inject_done = True
+                                    log.info(
+                                        "worker_manager.wait_for_vllm_health.ssh_inject_retry_ok",
+                                        worker_id=worker_id,
+                                        num_gpus=worker.num_gpus,
+                                    )
+                            log_text = await self._fetch_vllm_logs_ssh(instance, worker)
+                            if log_text:
+                                diagnosis = _diagnose_vllm_logs(log_text)
+                                if diagnosis:
+                                    log.warning(
+                                        "worker_manager.wait_for_vllm_health.fatal_log_detected",
+                                        worker_id=worker_id,
+                                        diagnosis=diagnosis,
+                                    )
+                                    await self._fail_worker(
+                                        worker,
+                                        reason=diagnosis,
+                                        logs=log_text,
+                                    )
+                                    return
+                    except Exception as exc:
+                        log.debug(
+                            "worker_manager.wait_for_vllm_health.log_check_failed",
+                            worker_id=worker_id,
+                            error=repr(exc),
+                        )
+
+            # ── 3. Ping vLLM health endpoint ──────────────────────────────
             try:
                 async with httpx.AsyncClient(timeout=settings.health_check_timeout_sec) as c:
                     r = await c.get(
                         url,
                         headers={"Authorization": f"Bearer {api_key}"},
                     )
-                    if r.status_code == 200:
-                        now = datetime.now(timezone.utc)
-                        self.db.update_worker_status(
-                            worker_id,
-                            WorkerStatus.RUNNING,
-                            running_since=now,
-                        )
-                        # Register in the load-balancer pool so it starts
-                        # receiving traffic immediately.
-                        self.lb.register(worker_id, "vastai", host, port, api_key)
-                        # Calculate total time from bid accepted → vLLM ready
-                        fresh = self.db.get_worker(worker_id)
-                        elapsed_sec = (
-                            round((now - fresh.created_at).total_seconds())
-                            if fresh and fresh.created_at
-                            else None
-                        )
-                        self.events.record(
+                    if r.status_code != 200:
+                        log.debug(
+                            "worker_manager.wait_for_vllm_health.not_ready",
                             worker_id=worker_id,
-                            event_type="health.ready",
-                            status=WorkerStatus.RUNNING.value,
-                            prev_status=WorkerStatus.STARTING.value,
-                            message=f"vLLM health check passed — serving at {host}:{port}",
-                            meta={"host": host, "port": port, "startup_sec": elapsed_sec},
+                            status=r.status_code,
                         )
-                        elapsed_str = (
-                            f" (ready in **{elapsed_sec // 60}m {elapsed_sec % 60}s**)"
-                            if elapsed_sec is not None
-                            else ""
-                        )
-                        log.info(
-                            "worker_manager.worker_ready",
-                            worker_id=worker_id,
-                            url=url,
-                            startup_sec=elapsed_sec,
-                        )
-                        await self.discord.send(
-                            f"**Worker ready** `{worker_id}` — "
-                            f"vLLM is serving at `{host}:{port}`{elapsed_str}.",
-                            "success",
-                        )
-                        return
-                    log.debug(
-                        "worker_manager.wait_for_vllm_health.not_ready",
-                        worker_id=worker_id,
-                        status=r.status_code,
-                    )
+                        await asyncio.sleep(_jitter(15))
+                        continue
             except Exception as exc:
                 log.debug(
                     "worker_manager.wait_for_vllm_health.ping_failed",
                     worker_id=worker_id,
                     error=str(exc),
                 )
-            await asyncio.sleep(15)
+                # Trigger an SSH log check on the next iteration so we see
+                # vLLM output immediately when the instance isn't responding.
+                # Using min() means we only advance the check if it's overdue —
+                # the check itself resets last_log_check so this won't spam.
+                last_log_check = min(
+                    last_log_check,
+                    loop.time() - _STARTUP_LOG_CHECK_INTERVAL,
+                )
+                await asyncio.sleep(_jitter(15))
+                continue
 
-        # Deadline exceeded — re-fetch worker, try SSH logs first (more detailed
-        # than the vast.ai API log endpoint), then fall back to the API.
+            # ── 4. Smoke-test: send a real inference request ──────────────
+            # /health can return 200 while CUDA graphs are still being captured.
+            # A successful chat completion confirms the model is truly serving.
+            smoke_ok = await self._smoke_test(host, port, api_key, worker_id)
+            if not smoke_ok:
+                await asyncio.sleep(_jitter(15))
+                continue
+
+            # ── 5. Mark worker RUNNING and register in LB ─────────────────
+            now = datetime.now(timezone.utc)
+            self.db.update_worker_status(
+                worker_id,
+                WorkerStatus.RUNNING,
+                running_since=now,
+            )
+            # Register in the load-balancer pool so it starts
+            # receiving traffic immediately.
+            await self.lb.register(worker_id, provider_name, host, port, api_key, ssh_port=ssh_port)
+            # Calculate total time from bid accepted → vLLM ready
+            fresh = self.db.get_worker(worker_id)
+            elapsed_sec = (
+                round((now - fresh.created_at).total_seconds())
+                if fresh and fresh.created_at
+                else None
+            )
+            self.events.record(
+                worker_id=worker_id,
+                event_type="health.ready",
+                status=WorkerStatus.RUNNING.value,
+                prev_status=WorkerStatus.STARTING.value,
+                message=f"vLLM health check and smoke test passed — serving at {host}:{port}",
+                meta={"host": host, "port": port, "startup_sec": elapsed_sec},
+            )
+            elapsed_str = (
+                f" (ready in **{elapsed_sec // 60}m {elapsed_sec % 60}s**)"
+                if elapsed_sec is not None
+                else ""
+            )
+            log.info(
+                "worker_manager.worker_ready",
+                worker_id=worker_id,
+                url=url,
+                startup_sec=elapsed_sec,
+            )
+            await self.discord.send(
+                f"**Worker ready** `{worker_id}` — "
+                f"vLLM is serving at `{host}:{port}`{elapsed_str}.",
+                "success",
+            )
+            return
+
+        # Deadline exceeded — SSH logs are more detailed; try them first.
         worker = self.db.get_worker(worker_id)
         logs: str = ""
         if worker and worker.instance_id:
             try:
-                instance = await self.vast.get_instance(worker.instance_id)
+                prov3 = self._providers.get(provider_name) or self._providers.get(worker.provider)
+                instance = await prov3.get_instance(worker.instance_id) if prov3 else None
                 if instance:
                     logs = await self._fetch_vllm_logs_ssh(instance, worker) or ""
                     if logs:
@@ -1147,75 +1426,133 @@ class WorkerManager:
                 worker=worker,
                 trigger="vllm_timeout",
             )
-        await self._fail_worker(
-            worker,
-            reason=f"vLLM health check timed out after {settings.worker_startup_timeout_sec // 60} min — model may have failed to load",
-            logs=logs,
-        )
 
-    # ── vast.ai cross-check loop ──────────────────────────────────────────
+        # Diagnose from logs; fall back to a generic timeout message.
+        reason = _diagnose_vllm_logs(logs) if logs else None
+        if not reason:
+            reason = (
+                f"vLLM health check timed out after "
+                f"{settings.worker_startup_timeout_sec // 60} min — model may have failed to load"
+            )
+        await self._fail_worker(worker, reason=reason, logs=logs)
 
-    async def _vast_monitor_loop(self) -> None:
+    # ── Smoke test ────────────────────────────────────────────────────────
+
+    async def _smoke_test(
+        self,
+        host: str,
+        port: int,
+        api_key: str,
+        worker_id: str,
+    ) -> bool:
         """
-        Background task — every vast_check_interval_sec:
-          • Reconcile DB workers against live vast.ai instances (sync)
+        Send a minimal chat-completion request to confirm the model is truly
+        serving.  /health can return 200 while CUDA graphs are still being
+        captured; a real inference call catches that gap.
+
+        Returns True on a successful 2xx response, False on any failure.
+        The caller should retry after a short sleep on False.
+        """
+        url = f"http://{host}:{port}/v1/chat/completions"
+        payload = {
+            "model":       settings.model_id,
+            "messages":    [{"role": "user", "content": "Hello"}],
+            "max_tokens":  5,
+            "temperature": 1.0,
+        }
+        log.info("worker_manager.smoke_test.start", worker_id=worker_id, url=url)
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as c:
+                r = await c.post(
+                    url,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+            if r.status_code == 200:
+                log.info(
+                    "worker_manager.smoke_test.passed",
+                    worker_id=worker_id,
+                    status=r.status_code,
+                )
+                return True
+            log.warning(
+                "worker_manager.smoke_test.failed",
+                worker_id=worker_id,
+                status=r.status_code,
+                body=r.text[:200],
+            )
+            return False
+        except Exception as exc:
+            log.warning(
+                "worker_manager.smoke_test.error",
+                worker_id=worker_id,
+                error=str(exc),
+            )
+            return False
+
+    # ── Provider cross-check loop ─────────────────────────────────────────
+
+    async def _provider_monitor_loop(self) -> None:
+        """
+        Background task — every provider_check_interval_sec:
+          • Reconcile DB workers against live provider instances (sync)
           • Every status_report_interval_sec post a summary to Discord
         """
         log.info(
-            "worker_manager.vast_monitor.start",
-            interval_sec=settings.vast_check_interval_sec,
+            "worker_manager.provider_monitor.start",
+            interval_sec=settings.provider_check_interval_sec,
         )
-        ticks_per_report = max(1, settings.status_report_interval_sec // settings.vast_check_interval_sec)
+        ticks_per_report = max(1, settings.status_report_interval_sec // settings.provider_check_interval_sec)
         tick = 0
         while True:
             try:
-                await asyncio.sleep(settings.vast_check_interval_sec)
-                await self._sync_with_vast()
+                await asyncio.sleep(_jitter(settings.provider_check_interval_sec))
+                await self._sync_with_provider()
                 tick += 1
                 if tick % ticks_per_report == 0:
                     await self._post_status_report()
             except asyncio.CancelledError:
-                log.info("worker_manager.vast_monitor.cancelled")
+                log.info("worker_manager.provider_monitor.cancelled")
                 break
             except Exception as exc:
-                log.error("worker_manager.vast_monitor.error", error=str(exc))
+                log.error("worker_manager.provider_monitor.error", error=str(exc))
 
-    async def _sync_with_vast(self) -> None:
+    async def _sync_with_provider(self) -> None:
         """
-        Cross-check every active DB worker against the live vast.ai instance list.
+        Cross-check every active DB worker against the live provider instance list.
 
         Three responsibilities:
-          1. Detect active workers whose vast.ai instance is gone / terminal → fail them
+          1. Detect active workers whose instance is gone / terminal → fail them
           2. Detect PENDING/STARTING workers whose instance is now running → start health check
-          3. Detect orphaned vast.ai instances (our label, not in our DB) → destroy them
+          3. Detect orphaned instances (our label, not in our DB) → destroy them
         """
         workers = self.db.get_active_workers()
 
         try:
-            all_instances = await self.vast.list_instances()
-            live = {str(i["id"]): i for i in all_instances}
+            all_instances = await self._all_instances()
+            live          = {i.instance_id: i for i in all_instances}
         except Exception as exc:
-            log.warning("worker_manager.vast_sync.list_failed", error=str(exc))
+            log.warning("worker_manager.provider_sync.list_failed", error=str(exc))
             return
 
         log.debug(
-            "worker_manager.vast_sync.tick",
+            "worker_manager.provider_sync.tick",
             active_workers=len(workers),
             live_instances=len(live),
         )
 
-        # ── 1 & 2: reconcile active DB workers against vast.ai ────────────
+        # ── 1 & 2: reconcile active DB workers against provider ───────────
         for worker in workers:
             if not worker.instance_id:
                 continue
 
-            instance = live.get(str(worker.instance_id))
+            instance = live.get(worker.instance_id)
 
             if not instance:
                 miss = self._instance_miss_counts.get(worker.worker_id, 0) + 1
                 self._instance_miss_counts[worker.worker_id] = miss
                 log.warning(
-                    "worker_manager.vast_sync.instance_missing",
+                    "worker_manager.provider_sync.instance_missing",
                     worker_id=worker.worker_id,
                     instance_id=worker.instance_id,
                     db_status=worker.status,
@@ -1229,7 +1566,7 @@ class WorkerManager:
                 logs = await self._fetch_worker_logs(worker.instance_id, worker=worker, trigger="instance_missing")
                 await self._fail_worker(
                     worker,
-                    reason=f"instance no longer exists on vast.ai after {miss} consecutive checks (reclaimed or deleted)",
+                    reason=f"instance no longer exists on provider after {miss} consecutive checks (reclaimed or deleted)",
                     logs=logs,
                 )
                 continue
@@ -1237,95 +1574,87 @@ class WorkerManager:
             # Instance found — reset miss counter
             self._instance_miss_counts.pop(worker.worker_id, None)
 
-            actual     = instance.get("actual_status", "")
-            cur_state  = instance.get("cur_state", "")
-            status_msg = instance.get("status_msg", "")
-
             log.debug(
-                "worker_manager.vast_sync.instance",
+                "worker_manager.provider_sync.instance",
                 worker_id=worker.worker_id,
                 instance_id=worker.instance_id,
-                actual_status=actual,
-                cur_state=cur_state,
-                status_msg=status_msg,
+                actual_status=instance.actual_status,
+                cur_state=instance.cur_state,
+                status_msg=instance.status_msg,
                 db_status=worker.status,
             )
 
-            if actual in _TERMINAL_STATES:
-                outbid = _is_outbid(instance)
+            if instance.is_terminal:
                 log.warning(
-                    "worker_manager.vast_sync.terminal",
+                    "worker_manager.provider_sync.terminal",
                     worker_id=worker.worker_id,
-                    actual_status=actual,
-                    status_msg=status_msg,
-                    outbid=outbid,
+                    actual_status=instance.actual_status,
+                    status_msg=instance.status_msg,
+                    outbid=instance.is_outbid,
                 )
                 logs = await self._fetch_worker_logs(worker.instance_id, worker=worker, trigger="terminal_state")
                 reason = (
-                    f"outbid: {status_msg}"
-                    if outbid
-                    else f"vast.ai reports {actual!r}: {status_msg}"
+                    f"outbid: {instance.status_msg}"
+                    if instance.is_outbid
+                    else f"provider reports {instance.actual_status!r}: {instance.status_msg}"
                 )
                 await self._fail_worker(worker, reason=reason, logs=logs)
 
             elif (
-                cur_state in {"stopped", "exited", "failed"}
+                instance.cur_state in {"stopped", "exited", "failed"}
                 and worker.status in (WorkerStatus.PENDING, WorkerStatus.STARTING)
             ):
                 # Container stopped during startup (e.g. outbid while pulling image).
                 # _wait_for_running won't catch this if get_instance can't see the
-                # instance, so _sync_with_vast acts as a safety net.
-                outbid = _is_outbid(instance)
+                # instance, so _sync_with_provider acts as a safety net.
                 log.warning(
-                    "worker_manager.vast_sync.stopped_during_startup",
+                    "worker_manager.provider_sync.stopped_during_startup",
                     worker_id=worker.worker_id,
                     instance_id=worker.instance_id,
-                    actual_status=actual,
-                    cur_state=cur_state,
+                    actual_status=instance.actual_status,
+                    cur_state=instance.cur_state,
                     db_status=worker.status,
-                    outbid=outbid,
+                    outbid=instance.is_outbid,
                 )
                 logs = await self._fetch_worker_logs(worker.instance_id, worker=worker, trigger="stopped_during_startup")
                 reason = (
-                    f"outbid: {status_msg}"
-                    if outbid
-                    else f"container stopped during startup (cur_state={cur_state!r}, actual={actual!r}): {status_msg}"
+                    f"outbid: {instance.status_msg}"
+                    if instance.is_outbid
+                    else f"container stopped during startup (cur_state={instance.cur_state!r}, actual={instance.actual_status!r}): {instance.status_msg}"
                 )
                 await self._fail_worker(worker, reason=reason, logs=logs)
 
-            elif actual != "running" and worker.status in (
+            elif instance.actual_status != "running" and worker.status in (
                 WorkerStatus.RUNNING, WorkerStatus.UNHEALTHY
             ):
-                # Instance was healthy but vast.ai no longer reports it as running
-                # (e.g. reclaimed, restarting). Fail immediately — vast.ai is ground truth.
-                outbid = _is_outbid(instance)
+                # Instance was healthy but provider no longer reports it as running
+                # (e.g. reclaimed, restarting). Fail immediately — provider is ground truth.
                 log.warning(
-                    "worker_manager.vast_sync.no_longer_running",
+                    "worker_manager.provider_sync.no_longer_running",
                     worker_id=worker.worker_id,
                     instance_id=worker.instance_id,
-                    actual_status=actual,
+                    actual_status=instance.actual_status,
                     db_status=worker.status,
-                    outbid=outbid,
+                    outbid=instance.is_outbid,
                 )
                 logs = await self._fetch_worker_logs(worker.instance_id, worker=worker, trigger="no_longer_running")
                 reason = (
-                    f"outbid: {status_msg}"
-                    if outbid
-                    else f"vast.ai reports {actual!r} (was RUNNING in DB): {status_msg}"
+                    f"outbid: {instance.status_msg}"
+                    if instance.is_outbid
+                    else f"provider reports {instance.actual_status!r} (was RUNNING in DB): {instance.status_msg}"
                 )
                 await self._fail_worker(worker, reason=reason, logs=logs)
 
             elif (
-                actual == "running"
+                instance.actual_status == "running"
                 and worker.status in (WorkerStatus.PENDING, WorkerStatus.STARTING)
             ):
                 # Instance came up while the orchestrator was restarting or the
                 # _wait_for_running task didn't fire. Kick off vLLM health check.
-                addr = self.vast.extract_worker_address(instance)
-                if addr:
-                    host, port = addr
+                if instance.host:
+                    host, port = instance.host, instance.port
                     log.info(
-                        "worker_manager.vast_sync.recovered_running",
+                        "worker_manager.provider_sync.recovered_running",
                         worker_id=worker.worker_id,
                         host=host,
                         port=port,
@@ -1341,6 +1670,8 @@ class WorkerManager:
                         host=host,
                         port=port,
                         api_key=worker.api_key,
+                        provider_name=worker.provider,
+                        ssh_port=instance.ssh_port,
                     )
 
         # ── 3: destroy orphaned instances ─────────────────────────────────
@@ -1350,42 +1681,46 @@ class WorkerManager:
         known_ids = self.db.get_known_instance_ids()
         ghcr_prefix = "ghcr.io/easedai/"
         for instance_id, instance in live.items():
-            label = instance.get("label", "") or ""
-            image = instance.get("image", "") or ""
-            is_ours = label.startswith("eased-") or ghcr_prefix in image
+            is_ours = instance.label.startswith("eased-") or ghcr_prefix in instance.image
             if not is_ours:
                 continue
             if instance_id in known_ids:
                 continue
-            actual = instance.get("actual_status", "")
             log.warning(
-                "worker_manager.vast_sync.orphan",
+                "worker_manager.provider_sync.orphan",
                 instance_id=instance_id,
-                label=label,
-                image=image,
-                actual_status=actual,
+                label=instance.label,
+                image=instance.image,
+                actual_status=instance.actual_status,
             )
             await self.discord.send(
-                f"**Orphaned instance** `{instance_id}` (label: `{label}`, image: `{image}`, status: `{actual}`) "
+                f"**Orphaned instance** `{instance_id}` "
+                f"(label: `{instance.label}`, image: `{instance.image}`, status: `{instance.actual_status}`) "
                 "has no DB record — destroying.",
                 "warning",
             )
             # Record to event log using the label-derived worker_id if possible
-            orphan_worker_id = label[6:] if label.startswith("eased-") and len(label) > 6 else instance_id
+            orphan_worker_id = (
+                instance.label[6:]
+                if instance.label.startswith("eased-") and len(instance.label) > 6
+                else instance_id
+            )
             self.events.record(
                 worker_id=orphan_worker_id,
                 event_type="orphan.destroyed",
                 status="terminated",
-                message=f"Orphaned instance {instance_id} (label: {label!r}, status: {actual!r}) — no DB record, destroying",
+                message=f"Orphaned instance {instance_id} (label: {instance.label!r}, status: {instance.actual_status!r}) — no DB record, destroying",
                 instance_id=instance_id,
-                label=label or None,
-                meta={"image": image, "actual_status": actual},
+                label=instance.label or None,
+                meta={"image": instance.image, "actual_status": instance.actual_status},
             )
             try:
-                await self.vast.destroy_instance(instance_id)
+                orphan_prov = self._providers.get(instance.provider)
+                if orphan_prov:
+                    await orphan_prov.destroy_instance(instance_id)
             except Exception as exc:
                 log.error(
-                    "worker_manager.vast_sync.orphan_destroy_failed",
+                    "worker_manager.provider_sync.orphan_destroy_failed",
                     instance_id=instance_id,
                     error=str(exc),
                 )
@@ -1405,8 +1740,10 @@ class WorkerManager:
         )
         while True:
             try:
-                await asyncio.sleep(settings.health_check_interval_sec)
+                await asyncio.sleep(_jitter(settings.health_check_interval_sec))
                 await self._check_all_workers()
+                if self._queue is not None:
+                    await self._queue.reclaim_orphaned()
             except asyncio.CancelledError:
                 log.info("worker_manager.health_monitor.cancelled")
                 break
@@ -1432,11 +1769,11 @@ class WorkerManager:
             # Log the last 5 lines of vLLM output for each monitored instance
             if worker.instance_id:
                 try:
-                    instance = await self.vast.get_instance(worker.instance_id)
+                    instance = await self._provider_for(worker).get_instance(worker.instance_id)
                     if instance:
                         tail = await self._fetch_vllm_logs_ssh(instance, worker, lines=5)
                         if tail and tail.strip():
-                            log.info(
+                            log.debug(
                                 "worker_manager.health_check.vllm_log_tail",
                                 worker_id=worker.worker_id,
                                 instance_id=worker.instance_id,
@@ -1465,6 +1802,14 @@ class WorkerManager:
                         WorkerStatus.RUNNING,
                         **extra,
                     )
+                    # Re-register with LB now that the worker is healthy again.
+                    # (provider_sync will also do this on its next cycle, but
+                    # registering here closes the gap.)
+                    if worker.host and worker.port:
+                        await self.lb.register(
+                            worker.worker_id, worker.provider,
+                            worker.host, worker.port, worker.api_key,
+                        )
                     self._ev(
                         worker, "health.recovered",
                         f"Health check passed — recovered from {worker.status.value} "
@@ -1495,12 +1840,287 @@ class WorkerManager:
                         logs=logs,
                     )
                 else:
-                    # Mark UNHEALTHY so it stops receiving traffic but isn't killed yet
+                    # Deregister from LB immediately on first failure so requests
+                    # stop being routed to this worker.  _fail_worker will also
+                    # call deregister when the threshold is reached; it is
+                    # idempotent so the double-call is harmless.
+                    await self.lb.deregister(worker.worker_id)
                     self.db.update_worker_status(
                         worker.worker_id,
                         WorkerStatus.UNHEALTHY,
                         consecutive_failures=new_failures,
                     )
+
+        await self._maybe_scale()
+
+    # ── Auto-scaling ──────────────────────────────────────────────────────────
+
+    async def _maybe_scale(self) -> None:
+        """
+        Evaluate current queue utilization and trigger scale-up or scale-down
+        if sustained thresholds are met.
+
+        Called at the end of every health-check tick so scaling decisions ride
+        the same cadence as health monitoring (health_check_interval_sec).
+        """
+        if self._queue is None:
+            return
+
+        available, leased, utilization = await self._queue.get_utilization()
+        total = available + leased
+
+        # Read and reset the 503 counter the LB increments on every no-worker response.
+        pending_503s = await self._queue.pop_503_count()
+
+        log.info(
+            "worker_manager.autoscale.tick",
+            available=available,
+            leased=leased,
+            total=total,
+            utilization=round(utilization, 2),
+            pending_503s=pending_503s,
+        )
+
+        # Maintain rolling window for scale-up (smooths over momentary spikes)
+        self._utilization_history.append(utilization)
+        if len(self._utilization_history) > settings.scale_up_consecutive_ticks:
+            self._utilization_history.pop(0)
+
+        if total > 0:
+            await self._maybe_scale_up(available, leased, pending_503s)
+            await self._maybe_scale_down()
+        else:
+            # Queue is empty — no utilization to compute.
+            # Defensively call _ensure_worker so that if no bid is already
+            # in progress (e.g. after a Redis flush or first-boot with a slow
+            # vLLM start), a new campaign starts automatically.
+            self._utilization_history.clear()
+            self._scale_down_ticks = 0
+            if pending_503s:
+                log.warning(
+                    "worker_manager.autoscale.no_workers_under_load",
+                    pending_503s=pending_503s,
+                    note="queue empty while requests are failing — ensuring a bid is in flight",
+                )
+            await self._ensure_worker()
+
+    async def _maybe_scale_up(self, available: int, leased: int, pending_503s: int = 0) -> None:
+        """
+        Bid for an additional worker when utilization has been sustained above
+        ``scale_up_threshold`` for ``scale_up_consecutive_ticks`` ticks,
+        OR when requests are actively failing (503s) with all workers leased.
+
+        Guards:
+          - Cooldown period after last scale-up (cold starts take 10–15 min)
+          - Already at max_instances
+          - A bid campaign is already in progress
+        """
+        avg = (
+            sum(self._utilization_history) / len(self._utilization_history)
+            if self._utilization_history
+            else 0.0
+        )
+
+        # Fast-path: all workers are leased AND requests are actively failing.
+        # Don't wait for the rolling window to fill — the queue is already saturated.
+        under_load = pending_503s > 0 and available == 0 and leased > 0
+        window_full = len(self._utilization_history) >= settings.scale_up_consecutive_ticks
+
+        if not under_load:
+            if not window_full:
+                return  # window not full yet, no immediate pressure
+            if avg < settings.scale_up_threshold:
+                return
+
+        running_workers = self.db.get_running_workers()
+        running_count   = len(running_workers)
+        if running_count >= settings.max_instances:
+            log.info(
+                "worker_manager.autoscale.scale_up.at_max",
+                running=running_count,
+                max_instances=settings.max_instances,
+                avg_utilization=round(avg, 2),
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        if self._last_scale_up_at is not None:
+            elapsed = (now - self._last_scale_up_at).total_seconds()
+            if elapsed < settings.scale_up_cooldown_sec:
+                log.debug(
+                    "worker_manager.autoscale.scale_up.cooldown",
+                    cooldown_remaining_sec=round(settings.scale_up_cooldown_sec - elapsed),
+                )
+                return
+
+        if self._bidding_task and not self._bidding_task.done():
+            log.debug("worker_manager.autoscale.scale_up.bid_already_in_progress")
+            return
+
+        trigger = (
+            f"{pending_503s} failing requests with all workers leased"
+            if under_load
+            else f"utilization {avg:.0%} over {settings.scale_up_consecutive_ticks} ticks"
+        )
+        log.warning(
+            "worker_manager.autoscale.scale_up.triggered",
+            trigger=trigger,
+            avg_utilization=round(avg, 2),
+            threshold=settings.scale_up_threshold,
+            pending_503s=pending_503s,
+            available=available,
+            leased=leased,
+            running=running_count,
+            max_instances=settings.max_instances,
+        )
+        cooldown_min = settings.scale_up_cooldown_sec // 60
+        await self.discord.send(
+            title="Scaling Up",
+            message=(
+                f"Trigger: **{trigger}**\n"
+                f"Launching a new bid campaign for worker "
+                f"**{running_count + 1} / {settings.max_instances}**."
+            ),
+            level="warning",
+            fields=[
+                {
+                    "name":   "Queue",
+                    "value":  f"{available} available · {leased} leased",
+                    "inline": True,
+                },
+                {
+                    "name":   "Fleet",
+                    "value":  f"{running_count} / {settings.max_instances} workers",
+                    "inline": True,
+                },
+                {
+                    "name":   "Cooldown after this",
+                    "value":  f"{cooldown_min} min",
+                    "inline": True,
+                },
+            ],
+        )
+        self._last_scale_up_at = now
+        self._utilization_history.clear()
+        self._bidding_task = asyncio.create_task(
+            self._bidding_campaign(), name="bid-campaign-autoscale"
+        )
+
+    async def _maybe_scale_down(self) -> None:
+        """
+        Terminate the most idle worker when the fleet is over-provisioned.
+
+        Only fires when:
+          - running_count > min_instances
+          - At least one worker has been idle > scale_down_idle_sec
+          - This condition has persisted for scale_down_consecutive_ticks ticks
+            (hysteresis prevents thrashing during bursty-but-light traffic)
+        """
+        running_workers = self.db.get_running_workers()
+        if len(running_workers) <= settings.min_instances:
+            self._scale_down_ticks = 0
+            return
+
+        idle_workers = await self._queue.get_idle_workers(settings.scale_down_idle_sec)
+        if not idle_workers:
+            self._scale_down_ticks = 0
+            return
+
+        self._scale_down_ticks += 1
+        log.debug(
+            "worker_manager.autoscale.scale_down.accumulating",
+            idle_workers=[wid for wid, _ in idle_workers],
+            ticks=self._scale_down_ticks,
+            needed=settings.scale_down_consecutive_ticks,
+        )
+        if self._scale_down_ticks < settings.scale_down_consecutive_ticks:
+            return
+
+        # Find the most idle worker that is still in the RUNNING state
+        idle_by_id = {wid: secs for wid, secs in idle_workers}
+        candidates = [w for w in running_workers if w.worker_id in idle_by_id]
+        if not candidates:
+            self._scale_down_ticks = 0
+            return
+
+        candidates.sort(key=lambda w: idle_by_id[w.worker_id], reverse=True)
+        target    = candidates[0]
+        idle_secs = idle_by_id[target.worker_id]
+
+        log.warning(
+            "worker_manager.autoscale.scale_down.triggered",
+            worker_id=target.worker_id,
+            idle_sec=round(idle_secs),
+            idle_min=round(idle_secs / 60, 1),
+            running=len(running_workers),
+            min_instances=settings.min_instances,
+        )
+        self._scale_down_ticks = 0
+        await self._scale_down_worker(target, idle_secs)
+
+    async def _scale_down_worker(self, worker: Worker, idle_secs: float) -> None:
+        """
+        Gracefully terminate an idle worker for scale-down.
+
+        Unlike ``_fail_worker``, this path:
+          - Does NOT attempt SSH log fetching (the worker is healthy, not broken)
+          - Does NOT trigger a new bid campaign after termination (intentional)
+          - Logs at INFO not ERROR (this is expected, not a failure)
+        """
+        idle_min = round(idle_secs / 60, 1)
+        log.info(
+            "worker_manager.scale_down_worker",
+            worker_id=worker.worker_id,
+            instance_id=worker.instance_id,
+            idle_min=idle_min,
+        )
+        self.db.update_worker_status(
+            worker.worker_id,
+            WorkerStatus.TERMINATED,
+            terminated_reason=f"idle scale-down ({idle_min}m idle)",
+        )
+        await self.lb.deregister(worker.worker_id)
+        self._ev(
+            worker, "worker.scale_down",
+            f"Worker terminated by auto scale-down after {idle_min}m idle",
+        )
+        if worker.instance_id:
+            try:
+                await self._provider_for(worker).destroy_instance(worker.instance_id)
+            except Exception as exc:
+                log.warning(
+                    "worker_manager.scale_down_worker.destroy_failed",
+                    instance_id=worker.instance_id,
+                    error=str(exc),
+                )
+            self.db.delete_worker(worker.worker_id)
+
+        remaining = len(self.db.get_running_workers())
+        await self.discord.send(
+            title="Scaling Down",
+            message=(
+                f"Worker `{worker.worker_id}` was idle for **{idle_min} min** "
+                f"(threshold: {settings.scale_down_idle_sec // 60} min) and has been terminated."
+            ),
+            level="info",
+            fields=[
+                {
+                    "name":   "GPU",
+                    "value":  worker.gpu_name or "unknown",
+                    "inline": True,
+                },
+                {
+                    "name":   "Instance",
+                    "value":  f"`{worker.instance_id}`" if worker.instance_id else "n/a",
+                    "inline": True,
+                },
+                {
+                    "name":   "Fleet",
+                    "value":  f"{remaining} / {settings.max_instances} workers remaining",
+                    "inline": True,
+                },
+            ],
+        )
 
     async def _ping_worker(self, worker: Worker) -> bool:
         url = f"{worker.base_url}/health"
@@ -1537,18 +2157,19 @@ class WorkerManager:
         logs: str = "",
     ) -> None:
         """
-        Mark a worker as TERMINATED, fetch container logs, destroy the vast.ai
-        instance, and post a Discord alert with reason + log tail.
+        Mark a worker as TERMINATED, destroy its instance, and post a Discord alert
+        with reason + log tail.
 
-        Logs are fetched (or re-fetched if the caller's attempt came back empty)
-        BEFORE the instance is destroyed so they are still available on the host.
+        If the worker was outbid, first attempts to raise the bid on the existing
+        instance.  Only falls through to full termination if the instance is already
+        gone or the bid cap is exceeded.
         """
         if worker is None:
             log.error("worker_manager.fail_worker.no_worker", reason=reason)
             return
 
         # ── Outbid: try raising the bid before giving up ──────────────────────
-        # vast.ai may accept a higher bid on the same instance before it is
+        # The provider may accept a higher bid on the same instance before it is
         # fully reclaimed, keeping the worker alive without a full restart.
         if (
             reason.startswith("outbid")
@@ -1570,7 +2191,7 @@ class WorkerManager:
                     cap=cap,
                 )
                 try:
-                    accepted = await self.vast.change_bid(worker.instance_id, new_bid)
+                    accepted = await self._provider_for(worker).change_bid(worker.instance_id, new_bid)
                     if accepted:
                         self.db.update_worker_status(
                             worker.worker_id, worker.status, bid_price=new_bid
@@ -1607,7 +2228,7 @@ class WorkerManager:
                 )
 
         # Re-read from DB to guard against concurrent failure paths (e.g.
-        # _wait_for_running and _vast_monitor_loop both detecting the same
+        # _wait_for_running and _sync_with_provider both detecting the same
         # missing instance and racing to call _fail_worker).
         current = self.db.get_worker(worker.worker_id)
         if current and current.status == WorkerStatus.TERMINATED:
@@ -1632,7 +2253,7 @@ class WorkerManager:
             terminated_reason=reason,
         )
         # Remove from LB pool immediately so no new requests are routed to it.
-        self.lb.deregister(worker.worker_id)
+        await self.lb.deregister(worker.worker_id)
         self._ev(
             worker, "worker.terminated",
             f"Worker terminated: {reason}",
@@ -1656,13 +2277,16 @@ class WorkerManager:
                 # Leave the instance alive so it can be SSH'd into for debugging.
                 # _enforce_debug_cap() will evict the newest debug instance
                 # before the next bid campaign to prevent unbounded accumulation.
-                # Outbid instances are never kept: vast.ai already reclaimed the
+                # Outbid instances are never kept: the provider already reclaimed the
                 # hardware, so there is nothing to SSH into.
+                # DB record is removed now — the instance_id is still logged in the
+                # event store if you need to find it later.
                 log.info(
                     "worker_manager.fail_worker.keeping_for_debug",
                     worker_id=worker.worker_id,
                     instance_id=worker.instance_id,
                 )
+                self.db.delete_worker(worker.worker_id)
             else:
                 if is_outbid:
                     log.info(
@@ -1671,18 +2295,18 @@ class WorkerManager:
                         instance_id=worker.instance_id,
                     )
                 try:
-                    await self.vast.destroy_instance(worker.instance_id)
-                    self.db.delete_worker(worker.worker_id)
-                    log.info(
-                        "worker_manager.fail_worker.deleted_from_db",
-                        worker_id=worker.worker_id,
-                    )
+                    await self._provider_for(worker).destroy_instance(worker.instance_id)
                 except Exception as exc:
                     log.warning(
                         "worker_manager.fail_worker.destroy_failed",
                         instance_id=worker.instance_id,
                         error=str(exc),
                     )
+                self.db.delete_worker(worker.worker_id)
+                log.info(
+                    "worker_manager.fail_worker.deleted_from_db",
+                    worker_id=worker.worker_id,
+                )
 
         log_section = (
             f"\n**Last logs:**\n```\n{logs[:1400]}\n```"
@@ -1695,16 +2319,67 @@ class WorkerManager:
             log.warning(
                 "worker_manager.fail_worker.preempted",
                 worker_id=worker.worker_id,
+                instance_id=worker.instance_id,
+                provider=worker.provider,
+                gpu=worker.gpu_name,
+                bid_price=worker.bid_price,
+                market_price=worker.market_price,
                 preemption_count=self._preemption_count,
                 next_bid_floor=f"{next_floor:.0%}",
             )
+            # Extract the provider's raw status message from the reason string
+            # ("outbid: <provider status_msg>").
+            provider_msg = reason[len("outbid:"):].strip() or "higher bid won"
+            total_vram = (worker.gpu_ram_gb or 0) * worker.num_gpus
+            gpu_desc = (
+                f"{worker.num_gpus}×{worker.gpu_name} ({total_vram:.0f} GB total)"
+                if worker.num_gpus > 1
+                else f"{worker.gpu_name} ({worker.gpu_ram_gb or '?'} GB)"
+            )
             await self.discord.send(
-                f"**Outbid** — `{worker.gpu_name}` instance `{worker.instance_id}` was claimed by a "
-                f"higher bidder and is no longer available.\n"
-                f"Preemption count this session: **{self._preemption_count}** — "
-                f"next campaign starts at **{next_floor:.0%}** of market price. "
-                "Starting a new bid campaign.",
-                "warning",
+                title="Outbid",
+                message=(
+                    f"Instance `{worker.instance_id}` was claimed by a higher bidder "
+                    "and is no longer available. Starting a new bid campaign."
+                ),
+                level="warning",
+                fields=[
+                    {
+                        "name":   "GPU",
+                        "value":  gpu_desc,
+                        "inline": True,
+                    },
+                    {
+                        "name":   "Provider",
+                        "value":  worker.provider,
+                        "inline": True,
+                    },
+                    {
+                        "name":   "Bid price",
+                        "value":  f"${worker.bid_price:.4f}/hr" if worker.bid_price else "n/a",
+                        "inline": True,
+                    },
+                    {
+                        "name":   "Market price",
+                        "value":  f"${worker.market_price:.4f}/hr" if worker.market_price else "n/a",
+                        "inline": True,
+                    },
+                    {
+                        "name":   "Preemptions this session",
+                        "value":  str(self._preemption_count),
+                        "inline": True,
+                    },
+                    {
+                        "name":   "Next bid floor",
+                        "value":  f"{next_floor:.0%} of market",
+                        "inline": True,
+                    },
+                    {
+                        "name":   "Provider status",
+                        "value":  provider_msg,
+                        "inline": False,
+                    },
+                ],
             )
         else:
             await self.discord.send(
@@ -1729,15 +2404,12 @@ class WorkerManager:
         # returns False even though the campaign is about to exit, so the normal
         # check would silently skip the restart. Detect this by comparing against
         # the current running task and always start fresh when that's the case.
-        current = asyncio.current_task()
+        current_task = asyncio.current_task()
         inside_bid_task = (
             self._bidding_task is not None
-            and self._bidding_task is current
+            and self._bidding_task is current_task
         )
         if inside_bid_task or not self._bidding_task or self._bidding_task.done():
-            # If we're inside the old bid task, it will finish naturally once
-            # _fail_worker returns. Schedule the new campaign to start after
-            # the current event-loop iteration so there's no overlap.
             if self._bidding_task and not self._bidding_task.done() and not inside_bid_task:
                 self._bidding_task.cancel()
             self._bidding_task = asyncio.create_task(
@@ -1748,20 +2420,11 @@ class WorkerManager:
 
     async def _enforce_debug_cap(self) -> None:
         """
-        When keep_debug_instance=True, ensure total alive vast.ai instances ≤
+        When keep_debug_instance=True, ensure total alive instances ≤
         max_instances + 1 (one slot reserved for a debug instance).
 
         Called before every new bid/on-demand launch so we never accumulate
         more than one debug instance.
-
-        Algorithm:
-          1. List alive instances from vast.ai.
-          2. Find TERMINATED workers in DB whose instance_id is still alive
-             (these are the kept-for-debug instances).
-          3. alive_count = active_workers + debug_instances
-          4. If alive_count >= cap (max_instances + 1), evict the NEWEST debug
-             instance(s) — i.e. the shortest-lived one — because that is NOT the
-             instance being actively debugged (the old failure is).
         """
         if not settings.keep_debug_instance:
             return
@@ -1769,22 +2432,22 @@ class WorkerManager:
         cap = settings.max_instances + 1
 
         try:
-            live_ids = {str(i["id"]) for i in await self.vast.list_instances()}
+            live_ids = {i.instance_id for i in await self._all_instances()}
         except Exception as exc:
             log.warning("worker_manager.debug_cap.list_failed", error=repr(exc))
             return
 
         active_workers  = self.db.get_active_workers()
-        # TERMINATED workers whose vast.ai instance is still alive
+        # TERMINATED workers whose instance is still alive
         terminated      = self.db.list_workers(status=WorkerStatus.TERMINATED)
         debug_instances = [
             w for w in terminated
-            if w.instance_id and str(w.instance_id) in live_ids
+            if w.instance_id and w.instance_id in live_ids
         ]
 
-        alive_count     = len(active_workers) + len(debug_instances)
+        alive_count    = len(active_workers) + len(debug_instances)
         # How many to evict so there is room for one new instance (alive < cap)
-        to_evict_count  = alive_count - (cap - 1)
+        to_evict_count = alive_count - (cap - 1)
 
         log.debug(
             "worker_manager.debug_cap.check",
@@ -1820,9 +2483,7 @@ class WorkerManager:
         to_evict = evictable[-to_evict_count:]
 
         for w in to_evict:
-            age_min = (
-                datetime.now(timezone.utc) - w.created_at
-            ).total_seconds() / 60
+            age_min = (datetime.now(timezone.utc) - w.created_at).total_seconds() / 60
             log.info(
                 "worker_manager.debug_cap.evicting",
                 worker_id=w.worker_id,
@@ -1838,7 +2499,7 @@ class WorkerManager:
                 "warning",
             )
             try:
-                await self.vast.destroy_instance(w.instance_id)
+                await self._provider_for(w).destroy_instance(w.instance_id)
             except Exception as exc:
                 log.error(
                     "worker_manager.debug_cap.destroy_failed",
@@ -1848,40 +2509,215 @@ class WorkerManager:
 
     # ── SSH key management ────────────────────────────────────────────────
 
-    async def _manage_vast_ssh_keys(self) -> None:
+    def _fetch_ssh_key_from_aws(self) -> Optional[str]:
         """
-        Remove any stale eased-orchestrator SSH keys from the vast.ai account,
-        then register the current session's public key.
+        Fetch the orchestrator SSH private key from AWS Secrets Manager.
+        Returns the PEM string on success, or None if unavailable.
+        Called in a thread executor to avoid blocking the event loop.
+        """
+        secret_name = "nemotron-vllm/orchestrator-ssh-private-key"
+        try:
+            client = boto3.client("secretsmanager", region_name=settings.aws_region)
+            resp = client.get_secret_value(SecretId=secret_name)
+            pem = resp.get("SecretString")
+            if pem:
+                log.info(
+                    "worker_manager.start.ssh_key_fetched",
+                    secret=secret_name,
+                )
+                return pem
+        except ClientError as exc:
+            log.warning(
+                "worker_manager.start.ssh_key_fetch_failed",
+                secret=secret_name,
+                error=repr(exc),
+            )
+        return None
 
-        Called once on startup.  This ensures old keys left behind by previous
-        orchestrator runs don't accumulate, while the new instance gets SSH access
-        injected via EXTRA_COMMANDS on every create_instance call.
+    async def _manage_ssh_keys(self) -> None:
+        """Register the orchestrator SSH key on every SSH-capable provider (e.g. vastai)."""
+        if not self._ssh_public_key:
+            return
+        for p in self._providers.values():
+            if p.supports_ssh:
+                await self._manage_ssh_keys_for(p)
+
+    async def _manage_ssh_keys_for(self, provider: GPUProvider) -> None:
+        """
+        Ensure the orchestrator's SSH public key is registered on *provider*.
+        Idempotent: skips the create call when a matching key already exists.
         """
         if not self._ssh_public_key:
             return
+
+        # OpenSSH pubkeys are "<algo> <base64-body> [<comment>]".  Two keys are
+        # the same iff algo + body match — comments are ignored.
+        our_parts = self._ssh_public_key.split()
+        if len(our_parts) < 2:
+            log.warning("worker_manager.ssh_keys.malformed_pubkey")
+            return
+        our_fingerprint = (our_parts[0], our_parts[1])
+
         try:
-            existing = await self.vast.list_ssh_keys()
+            existing = await provider.list_ssh_keys()
             for key in existing:
-                pubkey_str = key.get("public_key", "") or ""
-                if "eased-orchestrator" in pubkey_str:
-                    key_id = key.get("id")
-                    if key_id is not None:
-                        await self.vast.delete_ssh_key(int(key_id))
-                        log.info(
-                            "worker_manager.ssh_keys.removed_old",
-                            key_id=key_id,
-                            key_prefix=pubkey_str[:40],
-                        )
-            result = await self.vast.add_ssh_key(self._ssh_public_key)
+                pubkey_str = (key.get("public_key") or "").strip()
+                parts = pubkey_str.split()
+                if len(parts) >= 2 and (parts[0], parts[1]) == our_fingerprint:
+                    log.info(
+                        "worker_manager.ssh_keys.already_registered",
+                        key_id=key.get("id"),
+                        key_prefix=pubkey_str[:40],
+                    )
+                    return
+            result = await provider.add_ssh_key(self._ssh_public_key)
             log.info("worker_manager.ssh_keys.registered", result=result)
         except Exception as exc:
             log.warning("worker_manager.ssh_keys.manage_failed", error=repr(exc))
 
+    async def _attach_ssh_key_best_effort(self, instance_id: str, provider_name: str = "vastai") -> None:
+        """
+        Attach the orchestrator's SSH public key to a freshly created instance
+        via the provider's per-instance attach endpoint.  No-ops for providers
+        that don't support SSH.
+        """
+        if not self._ssh_public_key or not instance_id:
+            return
+        prov = self._providers.get(provider_name)
+        if not prov or not prov.supports_ssh:
+            return
+        try:
+            await prov.attach_ssh_key(instance_id, self._ssh_public_key)
+            log.info(
+                "worker_manager.ssh_keys.attached",
+                instance_id=instance_id,
+            )
+        except Exception as exc:
+            log.warning(
+                "worker_manager.ssh_keys.attach_failed",
+                instance_id=instance_id,
+                error=repr(exc),
+            )
+
     # ── SSH log fetching ──────────────────────────────────────────────────
+
+    async def _ssh_inject_env_and_restart_vllm(
+        self,
+        instance: InstanceInfo,
+        worker: Worker,
+    ) -> bool:
+        """
+        SSH into the instance, write /etc/vllm-env.sh with the orchestrator's
+        runtime config, and restart the vllm supervisor program so it picks up
+        the new env.
+
+        This is our primary config-injection path: vast.ai's API silently drops
+        the `env` dict (Docker -e vars) and EXTRA_COMMANDS on many hosts, so
+        values like VLLM_API_KEY, TENSOR_PARALLEL_SIZE and CUDA_VISIBLE_DEVICES
+        never reach the container via the API.  We bypass the API entirely by
+        using our SSH key (already injected into authorized_keys at launch) to
+        write the env file ourselves and kick supervisor.
+
+        Returns True on success.  Failure is non-fatal — the health-check loop
+        will still try, log diagnostics, and eventually time out if the vllm
+        process never becomes healthy.
+        """
+        if self._ssh_key is None:
+            log.debug(
+                "worker_manager.ssh_inject.no_key",
+                worker_id=worker.worker_id,
+            )
+            return False
+        if not (instance.ssh_host and instance.ssh_port):
+            log.debug(
+                "worker_manager.ssh_inject.no_ssh_port",
+                worker_id=worker.worker_id,
+                instance_id=worker.instance_id,
+            )
+            return False
+
+        # Build env from the same settings the vast.ai client would have
+        # baked into its (ignored) env dict.
+        # Prefer worker.num_gpus (set at bid time from the offer) over the live
+        # instance.specs value — the API response for a running instance may omit
+        # num_gpus, and the offer is the authoritative source of truth.
+        num_gpus = worker.num_gpus or int(instance.specs.get("num_gpus") or 1)
+        cuda_devices = ",".join(str(i) for i in range(num_gpus))
+        env_overrides: dict[str, str] = {
+            "VLLM_API_KEY":                worker.api_key,
+            "MODEL_ID":                    settings.model_id,
+            "HF_HOME":                     settings.hf_home,
+            "VLLM_CACHE_ROOT":             settings.vllm_cache_root,
+            "HF_HUB_ENABLE_HF_TRANSFER":   "1",
+            "VLLM_PORT":                   str(settings.vllm_port),
+            "VLLM_MAX_MODEL_LEN":          str(settings.vllm_max_model_len),
+            "VLLM_GPU_MEMORY_UTILIZATION": str(settings.vllm_gpu_memory_utilization),
+            "VLLM_VIDEO_LOADER_BACKEND":   settings.vllm_video_loader_backend,
+            "TENSOR_PARALLEL_SIZE":        str(num_gpus),
+            "DATA_PARALLEL_SIZE":          "1",
+            "CUDA_VISIBLE_DEVICES":        cuda_devices,
+        }
+        env_lines = "\n".join(f'export {k}="{v}"' for k, v in env_overrides.items())
+        env_script = f"#!/bin/bash\n{env_lines}\n"
+        env_b64 = base64.b64encode(env_script.encode()).decode()
+
+        # One-shot remote command: write env file, supervisorctl restart vllm.
+        # Uses base64 to avoid any quoting hazards across the SSH transport.
+        remote_cmd = (
+            f"echo {env_b64} | base64 -d > /etc/vllm-env.sh"
+            " && chmod 644 /etc/vllm-env.sh"
+            " && (supervisorctl restart vllm 2>&1 || true)"
+            " && echo OK"
+        )
+
+        host, port = instance.ssh_host, instance.ssh_port
+        log.info(
+            "worker_manager.ssh_inject.connecting",
+            worker_id=worker.worker_id,
+            host=host,
+            port=port,
+            num_gpus=num_gpus,
+        )
+        try:
+            async with asyncssh.connect(
+                host,
+                port=port,
+                username="root",
+                client_keys=[self._ssh_key],
+                known_hosts=None,
+                connect_timeout=20,
+            ) as conn:
+                result = await conn.run(remote_cmd, timeout=30)
+                ok = (result.stdout or "").strip().endswith("OK")
+                log.info(
+                    "worker_manager.ssh_inject.done",
+                    worker_id=worker.worker_id,
+                    ok=ok,
+                    stdout_tail=(result.stdout or "").strip()[-200:],
+                    stderr_tail=(result.stderr or "").strip()[-200:],
+                )
+                return ok
+        except asyncssh.PermissionDenied:
+            log.info(
+                "worker_manager.ssh_inject.permission_denied_reinjecting",
+                worker_id=worker.worker_id,
+                instance_id=worker.instance_id,
+            )
+            await self._attach_ssh_key_best_effort(worker.instance_id, worker.provider)
+            return False
+        except Exception as exc:
+            log.warning(
+                "worker_manager.ssh_inject.failed",
+                worker_id=worker.worker_id,
+                host=host,
+                port=port,
+                error=repr(exc),
+            )
+            return False
 
     async def _fetch_vllm_logs_ssh(
         self,
-        instance: dict,
+        instance: InstanceInfo,
         worker: Worker,
         lines: int = 150,
     ) -> Optional[str]:
@@ -1889,7 +2725,7 @@ class WorkerManager:
         SSH into the instance and collect debug logs.
 
         Fetches (in a single connection):
-          • /var/log/onstart.log  — vast.ai startup log: EXTRA_COMMANDS output,
+          • /var/log/onstart.log  — startup log: EXTRA_COMMANDS output,
                                     vLLM patch application, entrypoint invocation.
           • /tmp/vllm.log         — vLLM process stdout/stderr (tee'd by onstart.sh).
 
@@ -1898,9 +2734,7 @@ class WorkerManager:
         """
         if self._ssh_key is None:
             return None
-
-        addr = self.vast.extract_ssh_address(instance)
-        if not addr:
+        if not (instance.ssh_host and instance.ssh_port):
             log.debug(
                 "worker_manager.ssh_logs.no_ssh_port",
                 worker_id=worker.worker_id,
@@ -1908,21 +2742,25 @@ class WorkerManager:
             )
             return None
 
-        host, port = addr
+        host, port = instance.ssh_host, instance.ssh_port
         log.info(
             "worker_manager.ssh_logs.connecting",
             worker_id=worker.worker_id,
             host=host,
             port=port,
         )
-        # Single command: tail both log files and label each section clearly.
+        # Collect logs from all known locations in one SSH connection.
+        # /var/log/portal/vllm.log — supervisor log-tee (always present on vastai/base-image)
+        # /tmp/vllm.log            — tee'd by our onstart.sh (present when EXTRA_COMMANDS ran)
+        # /var/log/onstart.log     — EXTRA_COMMANDS output + entrypoint invocation
         cmd = (
-            f"echo '=== onstart.log (last {lines} lines) ===';"
-            f" tail -n {lines} /var/log/onstart.log 2>/dev/null"
-            " || echo '(no /var/log/onstart.log yet)';"
-            f" echo; echo '=== vllm.log (last {lines} lines) ===';"
-            f" tail -n {lines} /tmp/vllm.log 2>/dev/null"
-            " || echo '(no /tmp/vllm.log — entrypoint may not have started yet)'"
+            f"echo '=== vllm log (last {lines} lines) ===';"
+            f" tail -n {lines} /var/log/portal/vllm.log 2>/dev/null"
+            f" || tail -n {lines} /tmp/vllm.log 2>/dev/null"
+            " || echo '(no vllm log found yet)';"
+            f" echo; echo '=== onstart.log (last 50 lines) ===';"
+            " tail -n 50 /var/log/onstart.log 2>/dev/null"
+            " || echo '(no onstart.log yet)'"
         )
         try:
             async with asyncssh.connect(
@@ -1941,6 +2779,17 @@ class WorkerManager:
                     bytes=len(text),
                 )
                 return text or None
+        except asyncssh.PermissionDenied:
+            # Key not in authorized_keys — re-inject it via the provider API.
+            # Happens on instances that were provisioned before this key was
+            # registered (e.g. orchestrator restart with a new stable key).
+            log.info(
+                "worker_manager.ssh_logs.permission_denied_reinjecting",
+                worker_id=worker.worker_id,
+                instance_id=worker.instance_id,
+            )
+            await self._attach_ssh_key_best_effort(worker.instance_id, worker.provider)
+            return None
         except Exception as exc:
             log.debug(
                 "worker_manager.ssh_logs.failed",
@@ -1965,10 +2814,10 @@ class WorkerManager:
         for w in all_workers:
             by_status.setdefault(w.status.value, []).append(w)
 
-        running   = by_status.get("running", [])
-        unhealthy = by_status.get("unhealthy", [])
-        starting  = by_status.get("starting", [])
-        pending   = by_status.get("pending", [])
+        running    = by_status.get("running", [])
+        unhealthy  = by_status.get("unhealthy", [])
+        starting   = by_status.get("starting", [])
+        pending    = by_status.get("pending", [])
         terminated = by_status.get("terminated", [])
 
         now = datetime.now(timezone.utc)
@@ -2063,13 +2912,20 @@ class WorkerManager:
         trigger: str = "manual",
     ) -> str:
         """
-        Fetch the last ~100 lines of container logs from vast.ai, cache the full
+        Fetch the last ~100 lines of container logs from the provider, cache the full
         text in the event store, and return a short excerpt for Discord embeds.
         """
         if not instance_id:
             return "(no instance ID)"
+        prov = (
+            self._providers.get(worker.provider)
+            if worker
+            else next(iter(self._providers.values()), None)
+        )
+        if prov is None:
+            return "(no provider available)"
         try:
-            text = await self.vast.get_instance_logs(instance_id, tail=100)
+            text = await prov.get_instance_logs(instance_id, tail=100)
         except Exception as exc:
             log.warning(
                 "worker_manager.fetch_logs_failed",

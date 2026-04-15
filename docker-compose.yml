@@ -3,6 +3,7 @@
 # Both services build from the same context (eased/) and share app/ code.
 #
 # Services:
+#   redis           Worker queue — round-robin pool + lease tracking
 #   orchestrator    Background worker — manages vast.ai GPU workers (no HTTP)
 #   load-balancer   HTTP API — /v1/* proxy + /admin/* + /health + /workers
 #
@@ -13,10 +14,23 @@
 #
 # Ports:
 #   http://localhost:8000   load-balancer (/v1/*, /admin/*, /workers, /health)
+#   localhost:6379          Redis (worker queue — not exposed to host by default)
 # DynamoDB: uses real AWS (cloud) — ensure AWS_PROFILE is set and SSO session is active.
 # ──────────────────────────────────────────────────────────────────────────────
 
 services:
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   orchestrator:
     build:
@@ -27,12 +41,16 @@ services:
       LOG_LEVEL: DEBUG
       AWS_DEFAULT_REGION: us-east-1
       ORCHESTRATOR_ID: local
+      REDIS_URL: redis://redis:6379/0
     volumes:
       # Hot-reload source: the shared app/ package
       - ./app:/app/app
       # Mount host AWS config so the container can use your SSO session.
       # Run `aws sso login --profile <your-profile>` on the host before starting.
       - ${HOME}/.aws:/root/.aws
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   load-balancer:
@@ -45,6 +63,7 @@ services:
     environment:
       LOG_LEVEL: DEBUG
       AWS_DEFAULT_REGION: us-east-1
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - ./app:/app/app
       - ${HOME}/.aws:/root/.aws
@@ -55,4 +74,10 @@ services:
         --reload
         --reload-include "*.py"
         --log-level debug
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  redis-data:

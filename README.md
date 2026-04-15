@@ -6,6 +6,10 @@ a single stable endpoint. Production deployment runs on **ECS Fargate Spot** (no
 required). Worker nodes run on vast.ai interruptible instances, with automatic on-demand
 fallback.
 
+The orchestrator is built around a **`GPUProvider` abstraction** (`app/orchestrator/providers/`)
+so additional GPU marketplaces (RunPod, TensorDock, etc.) can be added without modifying
+the core orchestration logic.
+
 ---
 
 ## Architecture
@@ -17,15 +21,27 @@ Client
 API Gateway  ──►  Lambda Authorizer (Bearer token)
   │
   ▼
-ECS Fargate Spot  ──  Orchestrator (FastAPI)
-  │  manages + proxies
-  ├──► vast.ai interruptible GPU worker  ◄── vLLM + Nemotron 12B
-  └──► vast.ai on-demand GPU worker (fallback)
-       (spun up only when interruptible is reclaimed and pool is empty)
+ECS Fargate Spot ┬── Orchestrator  (background worker, no HTTP)
+                 │     manages GPU instances via GPUProvider interface
+                 │     ├── VastAIProvider (default)
+                 │     └── <future providers>
+                 │
+                 └── Load Balancer (FastAPI, port 8000)
+                       /v1/* proxy + /admin/* + /health + /workers
 
-State:  AWS DynamoDB  (worker records survive orchestrator restarts)
-Alerts: Discord webhook
+  GPU workers: vast.ai interruptible (bid) + on-demand fallback
+  State:  AWS DynamoDB  (worker records survive restarts)
+  Alerts: Discord webhook
 ```
+
+### Service layout
+
+Two containers, one shared `app/` package:
+
+| Service | Role | Entry point |
+|---|---|---|
+| `orchestrator` | Background worker — bids for GPU instances, monitors health, manages lifecycle | `python -m app.orchestrator.main` |
+| `load-balancer` | HTTP API — round-robin proxy to vLLM workers, `/admin/*`, `/health` | `uvicorn app.lb.main:app` |
 
 ### Orchestrator responsibilities
 
@@ -33,16 +49,15 @@ Alerts: Discord webhook
 |---|---|
 | **Bidding** | Starts at 50 % of median market price; retries every 5 min at +5 % until filled or cap (110 %) is hit |
 | **On-demand fallback** | Cold-starts one on-demand worker only when no interruptible worker exists |
-| **Proxy** | Forwards all `/v1/*` calls to the active worker; injects per-worker Bearer token |
+| **Outbid recovery** | When preempted, first tries `change_bid` API to raise the bid on the existing instance before falling back to a new campaign |
 | **Health checking** | Pings `/health` every 30 s; marks worker UNHEALTHY on first failure, TERMINATED after 3 consecutive failures |
-| **Vast.ai sync** | Every 60 s cross-checks DynamoDB workers against live vast.ai instances; detects reclaimed/orphaned instances |
-| **Startup discovery** | On start, scans vast.ai for owned instances not in DynamoDB and registers them (prevents redundant bids after a DB wipe) |
+| **Provider sync** | Every 60 s cross-checks DynamoDB workers against live provider instances; detects reclaimed/orphaned instances |
+| **Startup discovery** | On start, scans the provider for owned instances not in DynamoDB and registers them (prevents redundant bids after a DB wipe) |
 | **Orphan cleanup** | Destroys instances with our label or image that have no DB record |
 | **Recovery** | Destroys the failed instance, starts a new bid campaign automatically |
 | **State persistence** | DynamoDB — survives Fargate task restarts |
 | **Notifications** | Discord webhook for every meaningful lifecycle event + periodic fleet status reports (every 30 min) |
 | **Cost tracking** | Tracks per-instance running time and cost; reported in periodic Discord summaries and `/admin/health` |
-| **Template management** | Creates/reuses a reusable vast.ai instance template on startup; avoids re-specifying all instance fields on each bid |
 | **SSH log access** | Injects an Ed25519 public key into every new instance so it can SSH in to tail `/tmp/vllm.log` during startup |
 
 ### Worker image
@@ -56,8 +71,17 @@ Bakes the full Nemotron Nano 12B BF16 weights into the vLLM base image.
 - **Warm start** (same host, layer-cached): model load only (~5 min)
 - **Security**: `VLLM_API_KEY` is generated per-instance by the orchestrator and
   injected via vast.ai environment variables — never hardcoded
-- **vLLM patch**: A startup patch is applied to every new instance via `EXTRA_COMMANDS`
-  to fix a vLLM 0.19.0 crash (`encoder_budget.py`) with the NanoNemotronVLProcessor
+- **vLLM patches**: Six patches for vLLM 0.19.0 / `NanoNemotronVLProcessor` compatibility are baked
+  into the image at build time via `patch_vllm.py` (see `nemotron/patch_vllm.py` for details):
+  1. `encoder_budget.py` — `get_dummy_mm_inputs` crash; falls back to `max_model_len` per modality
+  2. `transformers_utils/processor.py` — missing `_merge_kwargs`; falls back to distributing common kwargs
+  3. `v1/worker/gpu_model_runner.py` — `_get_mm_dummy_batch` crash; skips encoder profiling on failure
+  4. `nano_nemotron_vl.py` — `video_num_patches` bounds check during dummy profiling
+  5. `nano_nemotron_vl.py` — EVS pruning `None` guard when `num_tubelets` is absent
+  6. `chat_completion/protocol.py` — `set_include_reasoning_for_none_effort` list input guard
+- **CUDA 13.0 required**: The worker image uses `vLLM 0.19.0+cu130` (PyTorch built for CUDA 13.0).
+  The orchestrator filters offers to hosts with `cuda_max_good >= 13.0` (driver ≥ 575).
+  Hosts with driver 560.x (CUDA 12.6) crash on `torch._C._cuda_init()` before loading the model.
 
 ---
 
@@ -84,26 +108,28 @@ aws sso login --profile <your-profile>
 docker compose up --build
 ```
 
-The orchestrator starts at **http://localhost:8000** with hot-reload enabled.
-AWS credentials are mounted from `~/.aws` — the container uses your host SSO session.
+Two containers start:
+- **orchestrator** — background worker that bids for GPU instances and monitors health (no HTTP port)
+- **load-balancer** — HTTP API at **http://localhost:8000** with hot-reload enabled
+
+AWS credentials are mounted from `~/.aws` — both containers use your host SSO session.
 
 On startup the orchestrator will scan vast.ai for any existing instances it owns,
 register them in DynamoDB, and then only bid for a new worker if none are found.
 
 ### API endpoints
 
+All endpoints are served by the **load-balancer** on port 8000.
+
 | Endpoint | Auth | Description |
 |---|---|---|
 | `GET  /health` | None | Basic liveness probe — returns status + uptime |
+| `GET  /workers` | None | List all workers currently in the LB pool |
 | `GET  /admin/health` | Bearer | Detailed fleet health: worker counts, per-instance cost, spend rate |
 | `GET  /admin/workers` | Bearer | List all workers and their full state |
-| `POST /admin/workers/refresh` | Bearer | Re-sync DynamoDB with live vast.ai state |
 | `POST /admin/workers/{id}/terminate` | Bearer | Destroy a specific worker |
-| `POST /admin/bid` | Bearer | Manually trigger a new bid campaign |
-| `GET  /admin/template` | Bearer | Show the current vast.ai template ID cached by the orchestrator |
-| `POST /admin/template/refresh` | Bearer | Re-run template creation (use after manually deleting the template in vast.ai) |
 | `GET  /admin/events/worker/{worker_id}` | Bearer | Event history for a worker |
-| `GET  /admin/events/instance/{instance_id}` | Bearer | Event history for a vast.ai instance |
+| `GET  /admin/events/instance/{instance_id}` | Bearer | Event history for a provider instance |
 | `GET  /admin/events/label/{label}` | Bearer | Event history by instance label (e.g. `eased-abc123`) |
 | `GET  /v1/models` | — | Proxied to the active vLLM worker |
 | `POST /v1/chat/completions` | — | Proxied to the active vLLM worker |
@@ -202,7 +228,15 @@ Runs on `ubuntu-latest`. On every push to `main` that touches `orchestrator/` or
 
 ## GPU provider options
 
-The orchestrator currently targets [vast.ai](https://vast.ai). The `source_type` field on each LB worker record is designed to support multiple providers in the future.
+The orchestrator uses a `GPUProvider` abstraction (`app/orchestrator/providers/`) to
+normalize offers and instances across providers.  Adding a new marketplace requires only:
+
+1. Create `app/orchestrator/providers/<name>.py` implementing `GPUProvider`
+2. Register it in `app/orchestrator/providers/__init__.py` → `get_provider()`
+3. Set the `PROVIDER` env var (not yet wired; defaults to `"vastai"`)
+
+The normalized types (`GPUOffer`, `InstanceInfo`, `CreateConfig`) shield
+`worker_manager.py` from provider-specific API details.
 
 ### Marketplace / spot (similar model to vast.ai)
 
@@ -238,7 +272,8 @@ The orchestrator queries the vast.ai marketplace for all interruptible GPU offer
 - ≥ 100 GB disk
 - ≥ 300 Mbps download
 - ≥ 90 % reliability rating
-- 1 GPU
+- CUDA compute capability ≥ SM 7.5 (Turing / T4+); SM 7.0 (V100) crashes with `cudaErrorNoKernelImageForDevice`
+- CUDA version ≥ 13.0 (`cuda_max_good`); older drivers crash on `torch._C._cuda_init()` with the cu130 image
 - **North America only** (US and Canada datacenters)
 
 The **market price** is defined as the median `dph_base` across all matching offers.
@@ -345,6 +380,8 @@ vast.ai on every Fargate task restart.
 | `MIN_DISK_GB` | `100` | Minimum instance disk (GB) |
 | `MIN_INET_DOWN_MBPS` | `300` | Minimum download speed (Mbps) |
 | `MIN_RELIABILITY` | `0.90` | Minimum host reliability score |
+| `MIN_COMPUTE_CAP` | `750` | Minimum CUDA compute capability (vast.ai integer format: 750 = SM 7.5). SM 7.0 (V100) crashes with `cudaErrorNoKernelImageForDevice`. |
+| `MIN_CUDA_VERSION` | `13.0` | Minimum CUDA version (`cuda_max_good`). The worker image uses `vLLM+cu130`; hosts with driver 560.x (CUDA 12.6) crash before loading the model. |
 
 ### Health checking
 

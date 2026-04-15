@@ -10,192 +10,99 @@ import structlog
 from ..config import settings
 from ..models import WorkerType
 
-# ── vLLM startup patches ──────────────────────────────────────────────────────
+
+# onstart.sh written to every instance at launch time.
+# Both image variants bake /entrypoint.sh, so no detection is needed:
+#   Dockerfile        → entrypoint.sh (direct vLLM launch)
+#   Dockerfile.vastai → vastai_entrypoint.sh copied to /entrypoint.sh (supervisord → vllm.sh)
 #
-# vLLM 0.19.0 (NVIDIA Nemotron fork) has three interrelated startup crashes
-# when loading NanoNemotronVLProcessor.  All occur in the dummy-input path
-# used to profile the multimodal encoder budget before serving begins.
-#
-# Patch 1 — encoder_budget.py
-#   get_mm_max_toks_per_item calls get_dummy_mm_inputs which crashes.
-#   Fix: wrap in try/except, fall back to max_model_len per modality.
-#
-# Patch 2 — transformers_utils/processor.py
-#   call_hf_processor_mm_only calls processor._merge_kwargs() which
-#   NanoNemotronVLProcessor does not implement.
-#   Fix: hasattr guard; fall back to distributing common kwargs per modality.
-#
-# Patch 3 — v1/worker/gpu_model_runner.py
-#   profile_run calls _get_mm_dummy_batch which also calls get_dummy_mm_inputs.
-#   Fix: wrap in try/except; skip encoder profiling on failure (first real
-#   request warms up the encoder instead).
-#
-# This Python script is base64-encoded and run via EXTRA_COMMANDS so it applies
-# automatically to every new instance before onstart.sh launches vLLM.
-# ─────────────────────────────────────────────────────────────────────────────
-_VLLM_PATCH_SCRIPT = """\
+# Patch 8 is applied here at runtime (before vLLM starts) rather than at Docker
+# build time because the worker image is pre-built and re-building just to add a
+# Python method override is expensive.  The patch is idempotent — it no-ops if
+# the target class already has _call_hf_processor defined.
+_ONSTART_SCRIPT = """\
+#!/bin/bash
+# Patch 8: NanoNemotronVLMultiModalProcessor._call_hf_processor
+# Fixes "Expected there to be 1 image items ... but only found 0!" on every
+# image inference request.  Without this override _apply_hf_processor_mm_only
+# falls through to call_hf_processor_mm_only, which tries processor.image_processor
+# — an attribute NanoNemotronVLProcessor does not expose — and returns {}.
+python3 - << 'PYEOF'
 import glob
-
-ROOTS = ['/opt', '/usr', '/root']
-
-def _find(name):
-    for r in ROOTS:
-        for p in glob.glob(r + '/**/' + name, recursive=True):
-            return p
-    return None
-
-def _patch(path, old, new, label):
-    if not path:
-        print('SKIP (not found):', label); return
-    src = open(path).read()
-    if old not in src:
-        print('SKIP (already patched?):', label); return
-    open(path, 'w').write(src.replace(old, new, 1))
-    print('patched:', label)
-
-# ── Patch 1: encoder_budget.py ──────────────────────────────────────────────
-_patch(
-    _find('encoder_budget.py'),
-    (
-        '    mm_inputs = mm_registry.get_dummy_mm_inputs(\\n'
-        '        model_config,\\n'
-        '        mm_counts=mm_counts,\\n'
-        '        processor=processor,\\n'
-        '    )\\n'
-        '\\n'
-        '    return {\\n'
-        '        modality: sum(item.get_num_embeds() for item in placeholders)\\n'
-        '        for modality, placeholders in mm_inputs[\\"mm_placeholders\\"].items()\\n'
-        '    }'
-    ),
-    (
-        '    try:\\n'
-        '        mm_inputs = mm_registry.get_dummy_mm_inputs(\\n'
-        '            model_config,\\n'
-        '            mm_counts=mm_counts,\\n'
-        '            processor=processor,\\n'
-        '        )\\n'
-        '    except Exception as _exc:\\n'
-        '        import logging as _l\\n'
-        '        _l.getLogger(__name__).warning(\\n'
-        '            "get_dummy_mm_inputs failed for %s (%s); "\\n'
-        '            "falling back to max_model_len=%d per modality",\\n'
-        '            type(processor).__name__, _exc, model_config.max_model_len,\\n'
-        '        )\\n'
-        '        return {m: model_config.max_model_len for m in mm_counts}\\n'
-        '\\n'
-        '    return {\\n'
-        '        modality: sum(item.get_num_embeds() for item in placeholders)\\n'
-        '        for modality, placeholders in mm_inputs[\\"mm_placeholders\\"].items()\\n'
-        '    }'
-    ),
-    'encoder_budget.py',
-)
-
-# ── Patch 2: transformers_utils/processor.py ────────────────────────────────
-_proc = None
-for _r in ROOTS:
-    for _p in glob.glob(_r + '/**/transformers_utils/processor.py', recursive=True):
-        _proc = _p; break
-_patch(
-    _proc,
-    (
-        '    output_kwargs = processor._merge_kwargs(\\n'
-        '        get_processor_kwargs_type(processor),\\n'
-        '        **kwargs,\\n'
-        '    )'
-    ),
-    (
-        '    if hasattr(processor, \\"_merge_kwargs\\"):\\n'
-        '        output_kwargs = processor._merge_kwargs(\\n'
-        '            get_processor_kwargs_type(processor),\\n'
-        '            **kwargs,\\n'
-        '        )\\n'
-        '    else:\\n'
-        '        _mk = {\\"text_kwargs\\", \\"audio_kwargs\\", \\"images_kwargs\\",\\n'
-        '               \\"videos_kwargs\\", \\"cross_attention_kwargs\\"}\\n'
-        '        _c = {k: v for k, v in kwargs.items() if k not in _mk}\\n'
-        '        output_kwargs = {\\n'
-        '            \\"audio_kwargs\\":  {**_c, **kwargs.get(\\"audio_kwargs\\",  {})},\\n'
-        '            \\"images_kwargs\\": {**_c, **kwargs.get(\\"images_kwargs\\", {})},\\n'
-        '            \\"videos_kwargs\\": {**_c, **kwargs.get(\\"videos_kwargs\\", {})},\\n'
-        '        }'
-    ),
-    'transformers_utils/processor.py',
-)
-
-# ── Patch 3: gpu_model_runner.py ────────────────────────────────────────────
-_patch(
-    _find('gpu_model_runner.py'),
-    (
-        '                        # Create dummy batch of multimodal inputs.\\n'
-        '                        batched_dummy_mm_inputs = self._get_mm_dummy_batch(\\n'
-        '                            dummy_modality,\\n'
-        '                            max_mm_items_per_batch,\\n'
-        '                        )\\n'
-        '\\n'
-        '                        # Run multimodal encoder.\\n'
-        '                        dummy_encoder_outputs = self.model.embed_multimodal(\\n'
-        '                            **batched_dummy_mm_inputs\\n'
-        '                        )\\n'
-        '\\n'
-        '                        sanity_check_mm_encoder_outputs(\\n'
-        '                            dummy_encoder_outputs,\\n'
-        '                            expected_num_items=max_mm_items_per_batch,\\n'
-        '                        )\\n'
-        '                        for i, output in enumerate(dummy_encoder_outputs):\\n'
-        '                            self.encoder_cache[f\\"tmp_{i}\\"] = output'
-    ),
-    (
-        '                        # Create dummy batch of multimodal inputs.\\n'
-        '                        try:\\n'
-        '                            batched_dummy_mm_inputs = self._get_mm_dummy_batch(\\n'
-        '                                dummy_modality,\\n'
-        '                                max_mm_items_per_batch,\\n'
-        '                            )\\n'
-        '                        except Exception as _gmr_exc:\\n'
-        '                            import logging as _l\\n'
-        '                            _l.getLogger(__name__).warning(\\n'
-        '                                "Skipping encoder profiling for %s - "\\n'
-        '                                "_get_mm_dummy_batch failed (%s). "\\n'
-        '                                "First real request will warm up the encoder.",\\n'
-        '                                dummy_modality, _gmr_exc,\\n'
-        '                            )\\n'
-        '                        else:\\n'
-        '                            dummy_encoder_outputs = self.model.embed_multimodal(\\n'
-        '                                **batched_dummy_mm_inputs\\n'
-        '                            )\\n'
-        '                            sanity_check_mm_encoder_outputs(\\n'
-        '                                dummy_encoder_outputs,\\n'
-        '                                expected_num_items=max_mm_items_per_batch,\\n'
-        '                            )\\n'
-        '                            for i, output in enumerate(dummy_encoder_outputs):\\n'
-        '                                self.encoder_cache[f\\"tmp_{i}\\"] = output'
-    ),
-    'gpu_model_runner.py',
-)
+for _r in ['/opt', '/usr', '/root', '/venv']:
+    for _p in glob.glob(_r + '/**/model_executor/models/nano_nemotron_vl.py', recursive=True):
+        _src = open(_p).read()
+        _old = (
+            'class NanoNemotronVLMultiModalProcessor(\\n'
+            '    BaseMultiModalProcessor[NanoNemotronVLProcessingInfo]\\n'
+            '):\\n'
+            '    def _get_image_fields_config(self, hf_inputs: BatchFeature):\\n'
+        )
+        _new = (
+            'class NanoNemotronVLMultiModalProcessor(\\n'
+            '    BaseMultiModalProcessor[NanoNemotronVLProcessingInfo]\\n'
+            '):\\n'
+            '    def _call_hf_processor(self, prompt, mm_data, mm_kwargs, tok_kwargs):\\n'
+            '        return self.info.ctx.call_hf_processor(\\n'
+            '            self.info.get_hf_processor(**mm_kwargs),\\n'
+            '            dict(text=prompt, **mm_data),\\n'
+            '            dict(**mm_kwargs, **tok_kwargs),\\n'
+            '        )\\n'
+            '\\n'
+            '    def _get_image_fields_config(self, hf_inputs: BatchFeature):\\n'
+        )
+        if _old in _src:
+            open(_p, 'w').write(_src.replace(_old, _new, 1))
+            print('[patch8] applied', _p)
+        else:
+            print('[patch8] already patched or mismatch', _p)
+        break
+    else:
+        continue
+    break
+PYEOF
+exec /opt/instance-tools/bin/entrypoint.sh 2>&1 | tee /tmp/vllm.log
 """
+_ONSTART_B64 = base64.b64encode(_ONSTART_SCRIPT.encode()).decode()
 
-_VLLM_PATCH_B64 = base64.b64encode(_VLLM_PATCH_SCRIPT.encode()).decode()
 
-
-def _build_start_cmd(ssh_public_key: Optional[str] = None) -> str:
+def _build_start_cmd(
+    env_overrides: dict[str, str],
+    ssh_public_key: Optional[str] = None,
+) -> str:
     """
     Build the EXTRA_COMMANDS value injected into every new vast.ai instance.
 
     Runs before onstart.sh:
-      1. Overwrite onstart.sh — exec entrypoint.sh, tee stdout to /tmp/vllm.log
+      1. Write /etc/vllm-env.sh with all runtime env vars (most reliable injection
+         path for ssh_direc/ssh_proxy runtype — sourced by vllm.sh at startup).
+      2. Overwrite onstart.sh — exec /entrypoint.sh, tee stdout to /tmp/vllm.log
          so the orchestrator can SSH in and read vLLM output during startup.
-      2. Inject orchestrator SSH public key into authorized_keys (if provided).
-      3. Apply three vLLM 0.19.0 patches for NanoNemotronVLProcessor compat:
-           - encoder_budget.py: wrap get_dummy_mm_inputs in try/except
-           - transformers_utils/processor.py: guard _merge_kwargs with hasattr
-           - gpu_model_runner.py: skip encoder profiling when dummy batch fails
+      3. Inject orchestrator SSH public key into authorized_keys (if provided).
+
+    vLLM patches are baked into the worker image at build time (patch_vllm.py) and
+    are not applied here — keeping EXTRA_COMMANDS short enough for vast.ai to accept.
     """
+    # Build /etc/vllm-env.sh content from the caller-supplied overrides.
+    # vllm.sh sources this file before scanning /proc/*/environ, so these values
+    # win regardless of how well Docker -e vars survive the SSH chain.
+    env_lines = "\n".join(f'export {k}="{v}"' for k, v in env_overrides.items())
+    env_script = f"#!/bin/bash\n{env_lines}\n"
+    env_b64 = base64.b64encode(env_script.encode()).decode()
+
+    # Also write the API key to a dedicated single-purpose file.  If vast.ai's
+    # boot chain overwrites /etc/vllm-env.sh (seen in the wild), this minimal
+    # file is far less likely to collide with anything in the base image.
+    api_key = env_overrides.get("VLLM_API_KEY", "")
+    api_key_b64 = base64.b64encode(api_key.encode()).decode()
+
     parts = [
-        # Tee vLLM output to a file readable over SSH
-        "printf '#!/bin/bash\\nexec /entrypoint.sh 2>&1 | tee /tmp/vllm.log\\n'"
-        " > /root/onstart.sh && chmod +x /root/onstart.sh",
+        # Write the env file first so vllm.sh always finds it.
+        f"echo {env_b64} | base64 -d > /etc/vllm-env.sh",
+        # Dedicated API-key file — survives even if /etc/vllm-env.sh is clobbered.
+        f"echo {api_key_b64} | base64 -d > /etc/vllm-api-key && chmod 600 /etc/vllm-api-key",
+        # Overwrite onstart.sh to tee all output to /tmp/vllm.log for SSH log fetching.
+        f"echo {_ONSTART_B64} | base64 -d > /root/onstart.sh && chmod +x /root/onstart.sh",
     ]
 
     if ssh_public_key:
@@ -206,8 +113,6 @@ def _build_start_cmd(ssh_public_key: Optional[str] = None) -> str:
             f" && printf '%s\\n' '{safe_key}' >> /root/.ssh/authorized_keys"
             " && chmod 600 /root/.ssh/authorized_keys"
         )
-
-    parts.append(f"echo {_VLLM_PATCH_B64} | base64 -d | python3")
 
     return " && ".join(parts)
 
@@ -231,16 +136,28 @@ class VastAIClient:
         """
         # vast.ai Search Offers API: POST /bundles/ with JSON body
         # type values: "ondemand", "bid", "reserved"
+        # Per-card VRAM floor: half of the total requirement.
+        # This lets multi-GPU offers (e.g. 2×24 GB) pass the API filter;
+        # VastAIProvider.search_offers then enforces the total VRAM check
+        # client-side (gpu_ram_gb * num_gpus >= min_gpu_ram_gb).
+        per_card_ram_mb = max(16 * 1024, settings.min_gpu_ram_gb * 1024 // 2)
         body: dict[str, Any] = {
             "verified":    {"eq": True},
             "type":        "ondemand" if on_demand else "bid",
             "rentable":    {"eq": True},
-            # vast.ai reports GPU RAM in MB
-            "gpu_ram":     {"gte": settings.min_gpu_ram_gb * 1024},
+            # vast.ai reports GPU RAM in MB (per card)
+            "gpu_ram":     {"gte": per_card_ram_mb},
             "disk_space":  {"gte": settings.min_disk_gb},
             "inet_down":   {"gte": settings.min_inet_down_mbps},
             "reliability2": {"gte": settings.min_reliability},
-            "num_gpus":    {"eq": 1},
+            # Exclude GPUs below the minimum CUDA compute capability.
+            # PyTorch in the worker image requires SM >= 7.5 (Turing/T4+).
+            # V100 is SM 7.0 and fails with cudaErrorNoKernelImageForDevice.
+            "compute_cap": {"gte": settings.min_compute_cap},
+            # Require CUDA >= 13.0 (vast.ai: cuda_max_good).  vLLM 0.19.0+cu130
+            # crashes on torch._C._cuda_init() on hosts with older drivers
+            # (e.g. 560.x which only supports CUDA 12.6).
+            "cuda_max_good": {"gte": settings.min_cuda_version},
             # North America only — US and Canada datacenters
             "geolocation": {"in": ["US", "CA"]},
         }
@@ -291,6 +208,7 @@ class VastAIClient:
         price: float,
         worker_api_key: str,
         worker_type: WorkerType,
+        num_gpus: int = 1,
         label: str = "",
         ssh_public_key: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -300,6 +218,9 @@ class VastAIClient:
         For interruptible workers the `price` is the bid amount.
         For on-demand workers it should equal the listed dph_base.
 
+        `num_gpus` is taken from the offer and used to set TENSOR_PARALLEL_SIZE
+        and CUDA_VISIBLE_DEVICES so vLLM uses every GPU on the machine.
+
         If `ssh_public_key` is provided it is injected into root's authorized_keys
         via EXTRA_COMMANDS so the orchestrator can SSH in during startup.
         """
@@ -308,10 +229,18 @@ class VastAIClient:
         # vast.ai's ssh_direc/ssh_proxy runtype bypasses the Docker ENTRYPOINT
         # and instead runs /root/onstart.sh.  EXTRA_COMMANDS runs before onstart.sh
         # and is used to:
+        #   • write /etc/vllm-env.sh with all runtime env vars (sourced by vllm.sh)
         #   • overwrite onstart.sh to exec entrypoint.sh (tee to /tmp/vllm.log)
         #   • inject the orchestrator SSH public key into authorized_keys
         #   • patch encoder_budget.py to fix the vLLM 0.19.0 startup crash
-        raw_env: dict[str, str] = {
+        #
+        # Use all GPUs on the instance for tensor parallelism (one model shard per
+        # GPU).  Data parallelism stays at 1 — we run one model replica per instance.
+        cuda_devices = ",".join(str(i) for i in range(num_gpus))
+
+        # These vars are written into /etc/vllm-env.sh by EXTRA_COMMANDS so they
+        # reach vllm.sh reliably — Docker -e vars don't survive the ssh_direc chain.
+        env_overrides: dict[str, str] = {
             "VLLM_API_KEY":                  worker_api_key,
             "MODEL_ID":                      settings.model_id,
             "HF_HOME":                       settings.hf_home,
@@ -321,8 +250,14 @@ class VastAIClient:
             "VLLM_MAX_MODEL_LEN":            str(settings.vllm_max_model_len),
             "VLLM_GPU_MEMORY_UTILIZATION":   str(settings.vllm_gpu_memory_utilization),
             "VLLM_VIDEO_LOADER_BACKEND":     settings.vllm_video_loader_backend,
-            "CUDA_VISIBLE_DEVICES":          "0",
-            "EXTRA_COMMANDS":                _build_start_cmd(ssh_public_key),
+            "TENSOR_PARALLEL_SIZE":          str(num_gpus),
+            "DATA_PARALLEL_SIZE":            "1",
+            "CUDA_VISIBLE_DEVICES":          cuda_devices,
+        }
+        raw_env: dict[str, str] = {
+            **env_overrides,
+            # EXTRA_COMMANDS writes env_overrides to /etc/vllm-env.sh before launch.
+            "EXTRA_COMMANDS": _build_start_cmd(env_overrides, ssh_public_key),
         }
         env_vars = {f"-e {k}={v}": "1" for k, v in raw_env.items()}
         payload: dict[str, Any] = {
@@ -568,20 +503,21 @@ class VastAIClient:
         """Return all SSH keys registered on the vast.ai account."""
         log.debug("vast.list_ssh_keys")
         async with httpx.AsyncClient(headers=self._headers, timeout=30) as client:
-            r = await client.get(f"{VAST_API_BASE}/keys/")
+            r = await client.get(f"{VAST_API_BASE}/ssh/")
             r.raise_for_status()
             data = r.json()
-        keys = data.get("keys", [])
+        # API returns a list directly
+        keys = data if isinstance(data, list) else data.get("keys", [])
         log.debug("vast.list_ssh_keys.result", count=len(keys))
-        return keys if isinstance(keys, list) else []
+        return keys
 
     async def add_ssh_key(self, pubkey_text: str) -> dict[str, Any]:
         """Register a new SSH public key on the vast.ai account."""
         log.info("vast.add_ssh_key", key_prefix=pubkey_text[:40])
         async with httpx.AsyncClient(headers=self._headers, timeout=30) as client:
             r = await client.post(
-                f"{VAST_API_BASE}/keys/",
-                json={"public_key": pubkey_text},
+                f"{VAST_API_BASE}/ssh/",
+                json={"ssh_key": pubkey_text},
             )
             log.debug("vast.add_ssh_key.response", status=r.status_code, body=r.text[:300])
             r.raise_for_status()
@@ -591,12 +527,41 @@ class VastAIClient:
         """Remove an SSH key from the vast.ai account by its numeric ID."""
         log.info("vast.delete_ssh_key", key_id=key_id)
         async with httpx.AsyncClient(headers=self._headers, timeout=30) as client:
-            r = await client.delete(f"{VAST_API_BASE}/keys/{key_id}/")
+            r = await client.delete(f"{VAST_API_BASE}/ssh/{key_id}/")
             if r.status_code == 404:
                 log.debug("vast.delete_ssh_key.already_gone", key_id=key_id)
                 return
             r.raise_for_status()
         log.debug("vast.delete_ssh_key.done", key_id=key_id)
+
+    async def attach_ssh_key(self, instance_id: str, pubkey_text: str) -> dict[str, Any]:
+        """
+        Attach an SSH public key to an existing instance.
+
+        POST /instances/{id}/ssh/  body: {"ssh_key": "<raw openssh pubkey>"}
+
+        vast.ai injects the key into the instance's authorized_keys out-of-band,
+        independent of the EXTRA_COMMANDS path run at launch.  This gives us a
+        reliable second channel for SSH access even if EXTRA_COMMANDS was dropped.
+        """
+        log.info(
+            "vast.attach_ssh_key",
+            instance_id=instance_id,
+            key_prefix=pubkey_text[:40],
+        )
+        async with httpx.AsyncClient(headers=self._headers, timeout=30) as client:
+            r = await client.post(
+                f"{VAST_API_BASE}/instances/{instance_id}/ssh/",
+                json={"ssh_key": pubkey_text},
+            )
+            log.debug(
+                "vast.attach_ssh_key.response",
+                instance_id=instance_id,
+                status=r.status_code,
+                body=r.text[:300],
+            )
+            r.raise_for_status()
+            return r.json()
 
     @staticmethod
     def extract_instance_specs(instance: dict[str, Any]) -> dict[str, Any]:
