@@ -116,4 +116,73 @@ fi
 
 [ -n "${VLLM_API_KEY:-}" ] && set -- "$@" --api-key "${VLLM_API_KEY}"
 
+# ── Runtime patch: NanoNemotronVLMultiModalProcessor._call_hf_processor ───────
+# Without this, call_hf_processor_mm_only returns empty for NanoNemotronVL
+# (no image_processor/video_processor sub-attributes), causing:
+#   RuntimeError: Expected there to be 1 image items … but only found 0!
+# Adding the _call_hf_processor override triggers the dummy-text path in
+# _apply_hf_processor_mm_only, which calls the full processor __call__ instead.
+python3 - << 'PATCH_EOF'
+import glob
+
+ROOTS = ['/opt', '/usr', '/root', '/venv']
+
+def _find(name):
+    for r in ROOTS:
+        for p in glob.glob(r + '/**/' + name, recursive=True):
+            return p
+    return None
+
+def _patch(path, old, new, label):
+    if not path:
+        print(f'[vllm-patch] SKIP (not found): {label}', flush=True)
+        return
+    src = open(path).read()
+    if old not in src:
+        print(f'[vllm-patch] SKIP (already patched): {label}', flush=True)
+        return
+    open(path, 'w').write(src.replace(old, new, 1))
+    print(f'[vllm-patch] applied: {label}', flush=True)
+
+_nano_model = _find('nano_nemotron_vl.py')
+for _r in ROOTS:
+    for _p in glob.glob(_r + '/**/model_executor/models/nano_nemotron_vl.py', recursive=True):
+        _nano_model = _p
+        break
+
+_patch(
+    _nano_model,
+    (
+        'class NanoNemotronVLMultiModalProcessor(\n'
+        '    BaseMultiModalProcessor[NanoNemotronVLProcessingInfo]\n'
+        '):\n'
+        '    def _get_image_fields_config(self, hf_inputs: BatchFeature):\n'
+    ),
+    (
+        'class NanoNemotronVLMultiModalProcessor(\n'
+        '    BaseMultiModalProcessor[NanoNemotronVLProcessingInfo]\n'
+        '):\n'
+        '    def _call_hf_processor(\n'
+        '        self,\n'
+        '        prompt: str,\n'
+        '        mm_data: "Mapping[str, object]",\n'
+        '        mm_kwargs: "Mapping[str, object]",\n'
+        '        tok_kwargs: "Mapping[str, object]",\n'
+        '    ) -> "BatchFeature":\n'
+        '        # Overriding this (even with the same body as the base class)\n'
+        '        # causes _apply_hf_processor_mm_only to use the dummy-text path\n'
+        '        # rather than call_hf_processor_mm_only, which fails because\n'
+        '        # NanoNemotronVLProcessor has no image_processor / video_processor.\n'
+        '        return self.info.ctx.call_hf_processor(\n'
+        '            self.info.get_hf_processor(**mm_kwargs),\n'
+        '            dict(text=prompt, **mm_data),\n'
+        '            dict(**mm_kwargs, **tok_kwargs),\n'
+        '        )\n'
+        '\n'
+        '    def _get_image_fields_config(self, hf_inputs: BatchFeature):\n'
+    ),
+    'nano_nemotron_vl.py NanoNemotronVLMultiModalProcessor._call_hf_processor',
+)
+PATCH_EOF
+
 exec python3 -m vllm.entrypoints.openai.api_server "$@"

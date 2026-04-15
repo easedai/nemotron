@@ -239,14 +239,19 @@ _patch(
 )
 
 # ── Patch 7: multimodal/processing/processor.py _merge_mm_kwargs ─────────────
-# NanoNemotronVL processes a single image as thumbnail + tile sub-images, so
-# the prompt contains 2 image placeholder positions (mm_hashes has 2 entries).
-# However MultiModalKwargsItems.from_hf_inputs() treats the batched pixel_values
-# tensor as 1 item, so mm_missing_kwargs and mm_missing_prompt_updates each have
-# only 1 entry.  On iteration 2 the code does missing_kwargs[1] → IndexError.
+# Two related IndexError sites in _merge_mm_kwargs:
 #
-# Fix: clamp both indices to the last available entry so the extra placeholder
-# position reuses the first image's data rather than crashing.
+# Case A — thumbnail/tile mismatch: NanoNemotronVL produces 2 hash entries
+#   (thumbnail + tile) but mm_missing_kwargs has only 1 item (the combined
+#   pixel_values tensor).  Iteration 2 does missing_kwargs[1] → IndexError.
+#
+# Case B — empty modality list: for image-only requests the video modality
+#   still gets hash entries in mm_hashes but zero kwargs items, so
+#   missing_kwargs == [] and min(x, -1) == -1 → list[-1] on empty → IndexError.
+#
+# Fix: wrap the block in `if missing_kwargs:`.  When non-empty, clamp the index
+# to the last item (handles Case A).  When empty, fall through to item=None so
+# cache.get_and_update_item treats it as a cache-only lookup (handles Case B).
 _mmproc = None
 for _r in ROOTS:
     for _p in glob.glob(_r + '/**/multimodal/processing/processor.py', recursive=True):
@@ -257,17 +262,89 @@ _patch(
     (
         '                    missing_kwargs_item = missing_kwargs[missing_next_idx]\n'
         '                    missing_updates_item = missing_prompt_updates[missing_next_idx]\n'
+        '\n'
+        '                    mm_missing_next_idx[modality] += 1\n'
+        '\n'
+        '                    item = missing_kwargs_item, missing_updates_item\n'
     ),
     (
-        '                    # Guard: NanoNemotronVL generates more hash entries\n'
-        '                    # than mm_kwargs/prompt_update items (thumbnail + tile\n'
-        '                    # mismatch in vLLM 0.19.0). Clamp to avoid IndexError.\n'
-        '                    _mi = min(missing_next_idx, len(missing_kwargs) - 1)\n'
-        '                    _pi = min(missing_next_idx, len(missing_prompt_updates) - 1)\n'
-        '                    missing_kwargs_item = missing_kwargs[_mi]\n'
-        '                    missing_updates_item = missing_prompt_updates[_pi]\n'
+        '                    if missing_kwargs:\n'
+        '                        # Guard: NanoNemotronVL thumbnail/tile mismatch and\n'
+        '                        # empty-modality case in vLLM 0.19.0. Clamp index to\n'
+        '                        # last available item; skip entirely when list is empty.\n'
+        '                        _mi = min(missing_next_idx, len(missing_kwargs) - 1)\n'
+        '                        _pi = min(missing_next_idx, len(missing_prompt_updates) - 1)\n'
+        '                        missing_kwargs_item = missing_kwargs[_mi]\n'
+        '                        missing_updates_item = missing_prompt_updates[_pi]\n'
+        '                        mm_missing_next_idx[modality] += 1\n'
+        '                        item = missing_kwargs_item, missing_updates_item\n'
+        '                    else:\n'
+        '                        # No kwargs items for this modality — treat as\n'
+        '                        # cache-only lookup (image/video mismatch).\n'
+        '                        item = None\n'
     ),
     'multimodal/processing/processor.py _merge_mm_kwargs bounds check',
+)
+
+# ── Patch 8: NanoNemotronVLMultiModalProcessor._call_hf_processor ────────────
+# Root cause of the "found 0 image items" RuntimeError on every inference:
+#
+# NanoNemotronVLProcessor does not expose image_processor / video_processor /
+# feature_extractor as sub-attributes.  call_hf_processor_mm_only() (used by
+# _apply_hf_processor_mm_only when no _call_hf_processor override exists) relies
+# on those attributes to call each sub-processor separately; when none are found
+# it returns an empty BatchFeature.  _apply_hf_processor_main then feeds this
+# empty result to from_hf_inputs, producing 0 kwargs items, and
+# _validate_mm_kwargs raises:
+#     RuntimeError: Expected there to be 1 image items … but only found 0!
+#
+# Fix: add _call_hf_processor to NanoNemotronVLMultiModalProcessor.  It is
+# intentionally identical to the base-class implementation.  The only effect is
+# that  type(self)._call_hf_processor != BaseMultiModalProcessor._call_hf_processor
+# becomes True, which causes _apply_hf_processor_mm_only to take the
+# dummy-text branch — it generates a placeholder prompt and calls the FULL
+# NanoNemotronVLProcessor.__call__ (which handles images and videos natively)
+# instead of the broken call_hf_processor_mm_only fallback.
+_nano_model = None
+for _r in ROOTS:
+    for _p in glob.glob(_r + '/**/model_executor/models/nano_nemotron_vl.py', recursive=True):
+        _nano_model = _p
+        break
+_patch(
+    _nano_model,
+    (
+        'class NanoNemotronVLMultiModalProcessor(\n'
+        '    BaseMultiModalProcessor[NanoNemotronVLProcessingInfo]\n'
+        '):\n'
+        '    def _get_image_fields_config(self, hf_inputs: BatchFeature):\n'
+    ),
+    (
+        'class NanoNemotronVLMultiModalProcessor(\n'
+        '    BaseMultiModalProcessor[NanoNemotronVLProcessingInfo]\n'
+        '):\n'
+        '    def _call_hf_processor(\n'
+        '        self,\n'
+        '        prompt: str,\n'
+        '        mm_data: "Mapping[str, object]",\n'
+        '        mm_kwargs: "Mapping[str, object]",\n'
+        '        tok_kwargs: "Mapping[str, object]",\n'
+        '    ) -> "BatchFeature":\n'
+        '        # Overriding this method (even with the same body as the base class)\n'
+        '        # causes _apply_hf_processor_mm_only to use the dummy-text path\n'
+        '        # rather than call_hf_processor_mm_only.  The latter tries\n'
+        '        # processor.image_processor / .video_processor which\n'
+        '        # NanoNemotronVLProcessor does not expose, returning an empty\n'
+        '        # BatchFeature and making image inference fail with\n'
+        '        # "found 0 image items".\n'
+        '        return self.info.ctx.call_hf_processor(\n'
+        '            self.info.get_hf_processor(**mm_kwargs),\n'
+        '            dict(text=prompt, **mm_data),\n'
+        '            dict(**mm_kwargs, **tok_kwargs),\n'
+        '        )\n'
+        '\n'
+        '    def _get_image_fields_config(self, hf_inputs: BatchFeature):\n'
+    ),
+    'nano_nemotron_vl.py NanoNemotronVLMultiModalProcessor._call_hf_processor',
 )
 
 print('vLLM patch complete', flush=True)
