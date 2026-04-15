@@ -238,4 +238,36 @@ _patch(
     'chat_completion/protocol.py set_include_reasoning_for_none_effort',
 )
 
+# ── Patch 7: multimodal/processing/processor.py _merge_mm_kwargs ─────────────
+# NanoNemotronVL processes a single image as thumbnail + tile sub-images, so
+# the prompt contains 2 image placeholder positions (mm_hashes has 2 entries).
+# However MultiModalKwargsItems.from_hf_inputs() treats the batched pixel_values
+# tensor as 1 item, so mm_missing_kwargs and mm_missing_prompt_updates each have
+# only 1 entry.  On iteration 2 the code does missing_kwargs[1] → IndexError.
+#
+# Fix: clamp both indices to the last available entry so the extra placeholder
+# position reuses the first image's data rather than crashing.
+_mmproc = None
+for _r in ROOTS:
+    for _p in glob.glob(_r + '/**/multimodal/processing/processor.py', recursive=True):
+        _mmproc = _p
+        break
+_patch(
+    _mmproc,
+    (
+        '                    missing_kwargs_item = missing_kwargs[missing_next_idx]\n'
+        '                    missing_updates_item = missing_prompt_updates[missing_next_idx]\n'
+    ),
+    (
+        '                    # Guard: NanoNemotronVL generates more hash entries\n'
+        '                    # than mm_kwargs/prompt_update items (thumbnail + tile\n'
+        '                    # mismatch in vLLM 0.19.0). Clamp to avoid IndexError.\n'
+        '                    _mi = min(missing_next_idx, len(missing_kwargs) - 1)\n'
+        '                    _pi = min(missing_next_idx, len(missing_prompt_updates) - 1)\n'
+        '                    missing_kwargs_item = missing_kwargs[_mi]\n'
+        '                    missing_updates_item = missing_prompt_updates[_pi]\n'
+    ),
+    'multimodal/processing/processor.py _merge_mm_kwargs bounds check',
+)
+
 print('vLLM patch complete', flush=True)
