@@ -1,0 +1,66 @@
+# syntax=docker/dockerfile:1
+#
+# Worker image for RunPod deployments.
+#
+# RunPod manages the container lifecycle directly (like Salad) — no supervisor
+# is needed.  The image runs vllm.sh as CMD; RunPod restarts the container
+# automatically when the restart policy is set to "always" in the pod spec.
+#
+# Networking: RunPod exposes port 8080 via an HTTPS proxy URL of the form
+#   https://<pod_id>-8080.proxy.runpod.net → container:8080
+#
+# Build:
+#   export HF_TOKEN=hf_...
+#   docker build --secret id=HF_TOKEN,env=HF_TOKEN \
+#     -f Dockerfile.runpod \
+#     -t ghcr.io/easedai/nemotron-runpod:latest .
+#
+#   # 30B model:
+#   docker build --secret id=HF_TOKEN,env=HF_TOKEN \
+#     --build-arg MODEL_ID=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
+#     -f Dockerfile.runpod \
+#     -t ghcr.io/easedai/nemotron-runpod:30b-a3b-bf16 .
+#
+
+FROM vllm/vllm-openai:v0.19.0
+
+# ── Model selection ────────────────────────────────────────────────────────────
+ARG MODEL_ID=nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16
+ENV MODEL_ID=${MODEL_ID}
+
+# ── Cache directories ──────────────────────────────────────────────────────────
+# Consistent with Dockerfile.salad and Dockerfile.vastai.
+ENV HF_HOME=/models/hf
+ENV VLLM_CACHE_ROOT=/models/vllm-cache
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
+
+# ── Extra dependencies ────────────────────────────────────────────────────────
+# opencv-python-headless: VLLM_VIDEO_LOADER_BACKEND=opencv for VL models.
+# hf_transfer: fast multi-part HF downloads at build time.
+RUN pip install --no-cache-dir opencv-python-headless "huggingface_hub[hf_transfer]"
+
+# ── Download model weights at build time ───────────────────────────────────────
+# HF_TOKEN is mounted as a BuildKit secret — never written into any image layer.
+RUN --mount=type=secret,id=HF_TOKEN \
+    python3 -c "\
+import os; \
+from huggingface_hub import snapshot_download; \
+model_id = os.environ['MODEL_ID']; \
+token = open('/run/secrets/HF_TOKEN').read().strip() if os.path.exists('/run/secrets/HF_TOKEN') else None; \
+print(f'Downloading {model_id} (token={bool(token)})'); \
+snapshot_download(model_id, token=token, ignore_patterns=['*.pt', 'original/']); \
+print('Download complete')"
+
+# ── vLLM 0.19.0 patches for NanoNemotronVLProcessor compat ──────────────────
+COPY patch_vllm.py /tmp/patch_vllm.py
+RUN python3 /tmp/patch_vllm.py && rm /tmp/patch_vllm.py
+
+# ── Startup script ────────────────────────────────────────────────────────────
+# vllm.sh is shared with Dockerfile.vastai and Dockerfile.salad.  It reads
+# VLLM_API_KEY and other env vars injected by the orchestrator via RunPod's
+# pod env array, then exec's vllm.entrypoints.openai.api_server.
+COPY vllm.sh /opt/vllm.sh
+RUN chmod +x /opt/vllm.sh
+
+EXPOSE 8080
+CMD ["/opt/vllm.sh"]
