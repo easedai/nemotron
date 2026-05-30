@@ -77,6 +77,7 @@ class VastAIProvider(GPUProvider):
             num_gpus=offer.num_gpus,
             label=config.label,
             ssh_public_key=config.ssh_public_key,
+            image_override=config.image_override,
         )
         instance_id = str(result.get("new_contract") or result.get("id") or "")
         if not instance_id:
@@ -149,4 +150,5 @@ class VastAIProvider(GPUProvider):
             ssh_port=ssh_addr[1] if ssh_addr else None,
             specs=VastAIClient.extract_instance_specs(raw),
             raw=raw,
+            is_spot=bool(raw.get("is_bid") or raw.get("bid_price")),
         )

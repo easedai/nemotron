@@ -90,7 +90,7 @@ class WorkerManager:
         self.db       = DynamoDB()
         self._providers: dict[str, GPUProvider] = {
             name: get_provider(name)
-            for name in [p.strip() for p in settings.providers.split(",") if p.strip()]
+            for name in settings.provider_list
         }
         self.discord  = Discord()
         self.events   = EventStore()
@@ -611,7 +611,7 @@ class WorkerManager:
 
     # ── Agentic bidding campaign ──────────────────────────────────────────
 
-    async def _bidding_campaign(self) -> None:
+    async def _bidding_campaign(self, override: dict | None = None) -> None:
         """
         Bid for a cheap interruptible GPU instance.
 
@@ -620,9 +620,13 @@ class WorkerManager:
           • Every bid_retry_interval_sec (default 5 min) increase by bid_step_pct (5 %)
           • Give up and fall back to on-demand once bid_max_multiplier (110 %) is exceeded
         """
+        _override_provider = (override or {}).get("provider")
+        _override_image    = (override or {}).get("image")
         log.info(
             "worker_manager.bid_campaign.start",
             preemption_count=self._preemption_count,
+            override_provider=_override_provider,
+            override_image=_override_image,
         )
         await self._enforce_debug_cap()
         preemption_note = (
@@ -700,12 +704,13 @@ class WorkerManager:
 
             bid_price = round(market_price * multiplier, 6)
 
-            # Pick the cheapest offer our bid can beat
-            best_offer: Optional[GPUOffer] = next(
-                (o for o in offers if o.price_per_hr <= bid_price),
-                None,
-            )
-            if not best_offer:
+            # All offers our bid can afford, cheapest first (provider filter from admin UI)
+            matching_offers = [
+                o for o in offers
+                if o.price_per_hr <= bid_price
+                and (_override_provider is None or o.provider == _override_provider)
+            ]
+            if not matching_offers:
                 cheapest = offers[0].price_per_hr if offers else None
                 log.info(
                     "worker_manager.bid_campaign.no_match",
@@ -731,32 +736,48 @@ class WorkerManager:
                     log.warning("worker_manager.bid_campaign.refresh_failed", error=str(exc))
                 continue
 
-            worker_id = secrets.token_urlsafe(8)
-            label     = f"eased-{worker_id}"
-            log.info(
-                "worker_manager.bid_campaign.placing",
-                attempt=attempt + 1,
-                offer_id=best_offer.offer_id,
-                bid_price=bid_price,
-                gpu=best_offer.gpu_name,
-                gpu_ram_gb=best_offer.gpu_ram_gb,
-                label=label,
-            )
-
-            try:
-                config = CreateConfig(
-                    worker_api_key=worker_api_key,
-                    on_demand=False,
-                    label=label,
-                    price=bid_price,
-                    ssh_public_key=self._ssh_public_key,
-                )
-                instance_id = await self._providers[best_offer.provider].create_instance(best_offer, config)
-            except Exception as exc:
-                log.error(
-                    "worker_manager.bid_campaign.create_failed",
+            # Try each affordable offer in price order — skip unavailable ones
+            # immediately rather than waiting the full retry interval per failure.
+            worker_id     = secrets.token_urlsafe(8)
+            label         = f"eased-{worker_id}"
+            best_offer    = None
+            instance_id   = ""
+            for candidate in matching_offers:
+                log.info(
+                    "worker_manager.bid_campaign.placing",
                     attempt=attempt + 1,
-                    error=str(exc),
+                    offer_id=candidate.offer_id,
+                    bid_price=bid_price,
+                    gpu=candidate.gpu_name,
+                    gpu_ram_gb=candidate.gpu_ram_gb,
+                    label=label,
+                )
+                try:
+                    config = CreateConfig(
+                        worker_api_key=worker_api_key,
+                        on_demand=False,
+                        label=label,
+                        price=bid_price,
+                        ssh_public_key=self._ssh_public_key,
+                        image_override=_override_image,
+                    )
+                    instance_id = await self._providers[candidate.provider].create_instance(candidate, config)
+                    best_offer  = candidate
+                    break
+                except Exception as exc:
+                    log.warning(
+                        "worker_manager.bid_campaign.offer_unavailable",
+                        attempt=attempt + 1,
+                        offer_id=candidate.offer_id,
+                        gpu=candidate.gpu_name,
+                        error=str(exc),
+                    )
+
+            if not best_offer:
+                log.error(
+                    "worker_manager.bid_campaign.all_offers_failed",
+                    attempt=attempt + 1,
+                    offers_tried=len(matching_offers),
                 )
                 await asyncio.sleep(_jitter(settings.bid_retry_interval_sec))
                 attempt += 1
@@ -827,8 +848,11 @@ class WorkerManager:
 
     # ── On-demand fallback ────────────────────────────────────────────────
 
-    async def _launch_on_demand(self) -> None:
-        log.info("worker_manager.on_demand.start")
+    async def _launch_on_demand(self, override: dict | None = None) -> None:
+        _override_provider = (override or {}).get("provider")
+        _override_image    = (override or {}).get("image")
+        log.info("worker_manager.on_demand.start",
+                 override_provider=_override_provider, override_image=_override_image)
         await self._enforce_debug_cap()
         await self.discord.send(
             "**Launching on-demand fallback** — more expensive, but no bidding delay.",
@@ -841,6 +865,8 @@ class WorkerManager:
             await self.discord.send(f"On-demand search failed: `{exc}`", "error")
             return
 
+        if _override_provider:
+            offers = [o for o in offers if o.provider == _override_provider]
         if not offers:
             log.error("worker_manager.on_demand.no_offers")
             await self.discord.send("No on-demand GPU offers found!", "error")
@@ -866,6 +892,7 @@ class WorkerManager:
                 label=label,
                 price=best.price_per_hr,
                 ssh_public_key=self._ssh_public_key,
+                image_override=_override_image,
             )
             instance_id = await self._providers[best.provider].create_instance(best, config)
         except Exception as exc:
@@ -1066,7 +1093,7 @@ class WorkerManager:
                               "image_pull_duration_sec": pull_duration},
                     )
                     pull_note = (
-                        f" Image pulled in **{pull_duration:.0f}s**."
+                        f" Container started in **{pull_duration:.0f}s**."
                         if pull_duration is not None
                         else ""
                     )
@@ -1211,7 +1238,7 @@ class WorkerManager:
         came up, or the orchestrator restarted after the container was already
         running, vLLM will eventually receive the correct env and be restarted.
         """
-        url  = f"http://{host}:{port}/health"
+        url = f"https://{host}/health" if port == 443 else f"http://{host}:{port}/health"
         loop = asyncio.get_event_loop()
         deadline = loop.time() + settings.worker_startup_timeout_sec
         _ssh_inject_done = ssh_inject_done  # mutable local copy
@@ -1453,7 +1480,7 @@ class WorkerManager:
         Returns True on a successful 2xx response, False on any failure.
         The caller should retry after a short sleep on False.
         """
-        url = f"http://{host}:{port}/v1/chat/completions"
+        url = f"https://{host}/v1/chat/completions" if port == 443 else f"http://{host}:{port}/v1/chat/completions"
         payload = {
             "model":       settings.model_id,
             "messages":    [{"role": "user", "content": "Hello"}],
@@ -1864,6 +1891,28 @@ class WorkerManager:
         the same cadence as health monitoring (health_check_interval_sec).
         """
         if self._queue is None:
+            return
+
+        # Honour manual scale requests from the admin UI (highest priority).
+        signal_kind, signal_cfg = await self._queue.pop_control_signal()
+        if signal_kind:
+            log.info(
+                "worker_manager.autoscale.manual_signal",
+                kind=signal_kind,
+                provider=signal_cfg.get("provider"),
+                image=signal_cfg.get("image"),
+            )
+            if signal_kind == "on_demand":
+                asyncio.create_task(
+                    self._launch_on_demand(override=signal_cfg),
+                    name="on-demand-manual",
+                )
+            else:
+                if not self._bidding_task or self._bidding_task.done():
+                    self._bidding_task = asyncio.create_task(
+                        self._bidding_campaign(override=signal_cfg),
+                        name="bid-campaign-manual",
+                    )
             return
 
         available, leased, utilization = await self._queue.get_utilization()

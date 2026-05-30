@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Optional
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 
 from ..config import settings
 from ..event_store import EventStore
@@ -174,3 +176,66 @@ async def get_instance_events(instance_id: str, limit: int = 100):
 async def get_label_events(label: str, limit: int = 100):
     """Lifecycle events + log snapshots for an instance label (e.g. eased-abc123)."""
     return {"events": _events.query_by_label(label, limit=limit)}
+
+
+# ── Config (read-only) ────────────────────────────────────────────────────────
+
+@router.get("/config", dependencies=[Depends(require_admin)])
+async def get_config():
+    """Return current orchestrator settings (read-only, safe to expose to the UI)."""
+    return {
+        "providers":               settings.provider_list,
+        "worker_image":            settings.worker_image,
+        "model_id":                settings.model_id,
+        "max_instances":           settings.max_instances,
+        "min_instances":           settings.min_instances,
+        "bid_start_pct":           settings.bid_start_pct,
+        "bid_max_multiplier":      settings.bid_max_multiplier,
+        "min_gpu_ram_gb":          settings.min_gpu_ram_gb,
+        "scale_up_threshold":      settings.scale_up_threshold,
+        "scale_up_cooldown_sec":   settings.scale_up_cooldown_sec,
+        "health_check_interval_sec": settings.health_check_interval_sec,
+    }
+
+
+# ── Scale controls ────────────────────────────────────────────────────────────
+
+class ScaleRequest(BaseModel):
+    provider:   Optional[str] = None   # pin to a specific provider (e.g. "vastai")
+    image:      Optional[str] = None   # override worker image for this launch
+
+
+@router.post("/scale/bid", dependencies=[Depends(require_admin)])
+async def trigger_bid(body: ScaleRequest, request: Request):
+    """Signal the orchestrator to start an interruptible (spot) bid campaign."""
+    queue = request.app.state.queue
+    cfg: dict = {}
+    if body.provider:
+        cfg["provider"] = body.provider
+    if body.image:
+        cfg["image"] = body.image
+    await queue.signal_scale_bid(cfg or None)
+    return {
+        "status": "signal_sent",
+        "kind":   "bid",
+        "config": cfg,
+        "note":   "Orchestrator will start bidding on its next health-check tick (~30 s).",
+    }
+
+
+@router.post("/scale/on-demand", dependencies=[Depends(require_admin)])
+async def trigger_on_demand(body: ScaleRequest, request: Request):
+    """Signal the orchestrator to launch an on-demand (non-spot) instance."""
+    queue = request.app.state.queue
+    cfg: dict = {}
+    if body.provider:
+        cfg["provider"] = body.provider
+    if body.image:
+        cfg["image"] = body.image
+    await queue.signal_scale_on_demand(cfg or None)
+    return {
+        "status": "signal_sent",
+        "kind":   "on_demand",
+        "config": cfg,
+        "note":   "Orchestrator will launch on-demand on its next health-check tick (~30 s).",
+    }

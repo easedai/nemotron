@@ -1,21 +1,20 @@
 # ── Local development stack ────────────────────────────────────────────────────
 #
-# Both services build from the same context (eased/) and share app/ code.
-#
 # Services:
 #   redis           Worker queue — round-robin pool + lease tracking
-#   orchestrator    Background worker — manages vast.ai GPU workers (no HTTP)
-#   load-balancer   HTTP API — /v1/* proxy + /admin/* + /health + /workers
+#   orchestrator    Background worker — manages GPU workers (no HTTP)
+#   load-balancer   HTTP API — /v1/* proxy + /admin/* + /ui + /health
+#   tailscale       Overlay network — shares LB's network namespace so the LB
+#                   is reachable on your tailnet as http://<TS_HOSTNAME>:8000
 #
 # Usage:
-#   cp .env.example .env   # fill in VASTAI_API_KEY, DISCORD_WEBHOOK_URL, etc.
+#   cp .env.example .env
 #   aws sso login --profile <your-profile>
 #   docker compose up --build
 #
-# Ports:
-#   http://localhost:8000   load-balancer (/v1/*, /admin/*, /workers, /health)
-#   localhost:6379          Redis (worker queue — not exposed to host by default)
-# DynamoDB: uses real AWS (cloud) — ensure AWS_PROFILE is set and SSO session is active.
+# Admin UI:  http://localhost:8000/ui  (or http://scale:8000/ui on tailnet)
+# Tailscale: generate an auth key at https://login.tailscale.com/admin/settings/keys
+#            Use "Ephemeral + Pre-authorized".  Set TS_AUTHKEY in .env.
 # ──────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -43,10 +42,7 @@ services:
       ORCHESTRATOR_ID: local
       REDIS_URL: redis://redis:6379/0
     volumes:
-      # Hot-reload source: the shared app/ package
       - ./app:/app/app
-      # Mount host AWS config so the container can use your SSO session.
-      # Run `aws sso login --profile <your-profile>` on the host before starting.
       - ${HOME}/.aws:/root/.aws
     depends_on:
       redis:
@@ -79,5 +75,34 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── Tailscale ──────────────────────────────────────────────────────────────
+  # Shares the load-balancer's network namespace so the LB is directly reachable
+  # on your tailnet at http://<TS_HOSTNAME>:8000 (and /ui for the admin panel).
+  #
+  # Required in .env:
+  #   TS_AUTHKEY=tskey-auth-...    # Ephemeral + Pre-authorized key
+  #   TS_HOSTNAME=scale            # How it appears in your tailnet
+  #
+  # Optional:
+  #   TS_EXTRA_ARGS=--accept-dns=false
+  tailscale:
+    image: tailscale/tailscale:latest
+    network_mode: service:load-balancer   # attach to LB's netns
+    environment:
+      TS_AUTHKEY:    ${TS_AUTHKEY:-}
+      TS_HOSTNAME:   ${TS_HOSTNAME:-scale}
+      TS_STATE_DIR:  /var/lib/tailscale
+      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:---accept-dns=false}
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    depends_on:
+      - load-balancer
+    restart: unless-stopped
+
 volumes:
   redis-data:
+  tailscale-state:

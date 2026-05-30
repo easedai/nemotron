@@ -211,6 +211,7 @@ class VastAIClient:
         num_gpus: int = 1,
         label: str = "",
         ssh_public_key: Optional[str] = None,
+        image_override: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Create an instance on offer_id.
@@ -260,9 +261,10 @@ class VastAIClient:
             "EXTRA_COMMANDS": _build_start_cmd(env_overrides, ssh_public_key),
         }
         env_vars = {f"-e {k}={v}": "1" for k, v in raw_env.items()}
+        image = image_override or settings.worker_image
         payload: dict[str, Any] = {
             "client_id": "me",
-            "image":     settings.worker_image,
+            "image":     image,
             "disk":      settings.worker_disk_gb,
             "env":       env_vars,
             # "ssh_direc ssh_proxy" gives SSH access; Docker ENTRYPOINT is bypassed
@@ -278,7 +280,7 @@ class VastAIClient:
         # Inject GHCR credentials so vast.ai workers can pull a private image.
         # vast.ai passes this string directly to `docker login` on the host.
         if settings.ghcr_username and settings.ghcr_pat:
-            registry = settings.worker_image.split("/")[0]  # e.g. ghcr.io
+            registry = image.split("/")[0]  # e.g. ghcr.io
             payload["login"] = f"-u {settings.ghcr_username} -p {settings.ghcr_pat} {registry}"
             log.debug("vast.create_instance.registry_auth", registry=registry, username=settings.ghcr_username)
         if worker_type == WorkerType.INTERRUPTIBLE:
@@ -289,7 +291,7 @@ class VastAIClient:
             offer_id=offer_id,
             price=price,
             worker_type=worker_type,
-            image=settings.worker_image,
+            image=image,
         )
         async with httpx.AsyncClient(headers=self._headers, timeout=30) as client:
             r = await client.put(f"{VAST_API_BASE}/asks/{offer_id}/", json=payload)

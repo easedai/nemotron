@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -17,6 +18,8 @@ _KEY_503_COUNT   = "workers:stats:503"    # STRING  – running count of 503s si
 _PFX_DATA        = "workers:data:"        # HASH    – per-worker metadata
 _PFX_LEASED      = "workers:leased:"      # HASH    – active LB leases (with TTL)
 _PFX_LAST_ACTIVE = "workers:last_active:" # STRING  – ISO timestamp of last completed request
+_KEY_CTRL_BID    = "control:scale_bid"    # STRING  – admin UI → orchestrator: start bid campaign
+_KEY_CTRL_OD     = "control:scale_od"     # STRING  – admin UI → orchestrator: start on-demand
 
 # ── Lua scripts ───────────────────────────────────────────────────────────────
 # KEYS[1]=workers:available  KEYS[2]=workers:draining
@@ -470,6 +473,32 @@ class WorkerQueue:
 
         result.sort(key=lambda x: x[1], reverse=True)
         return result
+
+    # ── Admin UI control signals ─────────────────────────────────────────────
+
+    async def signal_scale_bid(self, config: dict | None = None) -> None:
+        """Signal orchestrator to start an interruptible bid campaign.
+        Config may include: provider (str), image (str)."""
+        await self._r.set(_KEY_CTRL_BID, json.dumps(config or {}), ex=300)
+
+    async def signal_scale_on_demand(self, config: dict | None = None) -> None:
+        """Signal orchestrator to launch an on-demand instance."""
+        await self._r.set(_KEY_CTRL_OD, json.dumps(config or {}), ex=300)
+
+    async def pop_control_signal(self) -> tuple[str | None, dict]:
+        """
+        Consume and return (kind, config) if a manual scale signal is pending.
+        kind is 'bid', 'on_demand', or None.  Consumes only one signal per call.
+        """
+        for key, kind in [(_KEY_CTRL_BID, "bid"), (_KEY_CTRL_OD, "on_demand")]:
+            raw = await self._r.getdel(key)
+            if raw is not None:
+                try:
+                    cfg = json.loads(raw)
+                except Exception:
+                    cfg = {}
+                return kind, cfg
+        return None, {}
 
     # ── Observability ────────────────────────────────────────────────────────
 

@@ -16,6 +16,7 @@ from ..lb_queue import WorkerQueue
 from .admin import router as admin_router
 from .proxy import proxy_request
 from .router import WorkerRouter
+from .ui import router as ui_router
 
 # ── Structured logging ────────────────────────────────────────────────────────
 
@@ -89,6 +90,7 @@ app = FastAPI(
 )
 
 app.include_router(admin_router)
+app.include_router(ui_router)
 
 # ── Ops ───────────────────────────────────────────────────────────────────────
 

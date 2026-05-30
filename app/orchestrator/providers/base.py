@@ -50,6 +50,10 @@ class InstanceInfo:
     ssh_port:      Optional[int] = None
     specs:         dict[str, Any] = field(default_factory=dict)
     raw:           dict[str, Any] = field(default_factory=dict)
+    # True when the instance was created as a spot/interruptible bid (not on-demand).
+    # Providers should set this so outbid detection works even when the provider
+    # doesn't include "outbid"/"preempted" in status_msg (e.g. vast.ai).
+    is_spot:       bool = False
 
     @property
     def is_terminal(self) -> bool:
@@ -61,7 +65,12 @@ class InstanceInfo:
         """True when the instance was stopped because a higher bid won."""
         keywords = ("outbid", "preempted", "overbid")
         haystack = (self.status_msg + " " + self.cur_state).lower()
-        return any(kw in haystack for kw in keywords)
+        if any(kw in haystack for kw in keywords):
+            return True
+        # Spot instances that exit without an explicit error were reclaimed by a
+        # higher bidder.  Providers like vast.ai don't set "outbid" in status_msg —
+        # they just transition actual_status to "exited".
+        return self.is_spot and self.actual_status == "exited"
 
 
 @dataclass
@@ -72,6 +81,7 @@ class CreateConfig:
     label:          str
     price:          float
     ssh_public_key: Optional[str] = None
+    image_override: Optional[str] = None  # override settings.worker_image for this instance
 
 
 # ── Abstract provider ─────────────────────────────────────────────────────────
