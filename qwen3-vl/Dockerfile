@@ -39,7 +39,7 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/models/hf \
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    HF_XET_HIGH_PERFORMANCE=1 \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -64,38 +64,24 @@ ARG BASE_MODEL="Qwen/Qwen3-VL-8B-Instruct"
 
 RUN --mount=type=secret,id=HF_TOKEN \
     HF_TOKEN="$(cat /run/secrets/HF_TOKEN 2>/dev/null || true)" \
-    huggingface-cli download "$BASE_MODEL"
+    hf download "$BASE_MODEL"
 
 # Bake the chosen model as the container default so entrypoint.sh picks it up.
 ENV BASE_MODEL=${BASE_MODEL}
 
 # ── Optional build-time adapter bake-in ────────────────────────────────────
-# Pass --build-arg ADAPTER_URL=https://… or a HuggingFace Hub ID to embed an
-# adapter into the image.  ADAPTER_NAME sets the default model ID for /v1/models
-# (can still be overridden at runtime via the ADAPTER_NAME env var).
+# Pass --build-arg ADAPTER_URL=https://…/adapter.zip to embed an adapter into
+# the image.  ADAPTER_NAME sets the default model ID for /v1/models (can still
+# be overridden at runtime via the ADAPTER_NAME env var).
 ARG ADAPTER_URL=""
 ARG ADAPTER_NAME=""
 
-RUN --mount=type=secret,id=HF_TOKEN \
-    if [ -n "$ADAPTER_URL" ]; then \
-        HF_TOKEN="$(cat /run/secrets/HF_TOKEN 2>/dev/null || true)"; \
+RUN if [ -n "$ADAPTER_URL" ]; then \
+        echo "Downloading adapter from $ADAPTER_URL …"; \
         mkdir -p /tmp/adapter_extract; \
-        case "$ADAPTER_URL" in \
-            http://*|https://*) \
-                echo "Downloading adapter archive from $ADAPTER_URL …"; \
-                curl -fsSL "$ADAPTER_URL" -o /tmp/adapter_archive; \
-                case "$ADAPTER_URL" in \
-                    *.zip)                 unzip -q /tmp/adapter_archive -d /tmp/adapter_extract ;; \
-                    *.tar.gz|*.tgz|*.tar)  tar -xf /tmp/adapter_archive -C /tmp/adapter_extract --one-top-level ;; \
-                    *) echo "ERROR: unsupported archive format: $ADAPTER_URL" && exit 1 ;; \
-                esac; \
-                rm /tmp/adapter_archive; \
-                ;; \
-            *) \
-                echo "Downloading adapter from HuggingFace Hub: $ADAPTER_URL …"; \
-                HF_TOKEN="$HF_TOKEN" huggingface-cli download "$ADAPTER_URL" --local-dir /tmp/adapter_extract; \
-                ;; \
-        esac; \
+        curl -fsSL "$ADAPTER_URL" -o /tmp/adapter.zip; \
+        unzip -q /tmp/adapter.zip -d /tmp/adapter_extract; \
+        rm /tmp/adapter.zip; \
         ADAPTER_DIR=$(find /tmp/adapter_extract -name "adapter_config.json" | head -1 | xargs dirname); \
         echo "Installing adapter from $ADAPTER_DIR"; \
         cp -r "$ADAPTER_DIR"/. /adapters/checkpoint/; \

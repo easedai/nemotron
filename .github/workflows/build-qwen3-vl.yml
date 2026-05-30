@@ -14,7 +14,7 @@ on:
         required: false
         default: "Qwen/Qwen3-VL-8B-Instruct"
       adapter_url:
-        description: "HTTPS URL or HuggingFace Hub ID for a LoRA adapter archive (leave blank to skip)"
+        description: "HTTPS URL to a .zip LoRA adapter archive (leave blank to skip)"
         required: false
         default: ""
       adapter_name:
