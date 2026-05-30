@@ -87,15 +87,21 @@ services:
   #   TS_EXTRA_ARGS=--accept-dns=false
   tailscale:
     image: tailscale/tailscale:latest
-    network_mode: service:load-balancer   # attach to LB's netns
+    network_mode: service:load-balancer   # attach to LB's netns — same IP, same ports
     environment:
-      TS_AUTHKEY:    ${TS_AUTHKEY:-}
-      TS_HOSTNAME:   ${TS_HOSTNAME:-scale}
-      TS_STATE_DIR:  /var/lib/tailscale
-      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:---accept-dns=false}
+      TS_AUTHKEY:      ${TS_AUTHKEY:-}
+      TS_HOSTNAME:     ${TS_HOSTNAME:-scale}
+      TS_STATE_DIR:    /var/lib/tailscale
+      TS_EXTRA_ARGS:   ${TS_EXTRA_ARGS:---accept-dns=false}
+      # HTTPS via tailscale serve — terminates TLS and proxies to the LB.
+      # Requires HTTPS certificates enabled in your Tailscale admin console
+      # (admin.tailscale.com → DNS → Enable HTTPS certificates).
+      # Leave blank to serve plain HTTP only.
+      TS_SERVE_CONFIG: ${TS_SERVE_CONFIG:-/config/serve.json}
     volumes:
       - tailscale-state:/var/lib/tailscale
       - /dev/net/tun:/dev/net/tun
+      - ./tailscale-serve.json:/config/serve.json:ro
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
