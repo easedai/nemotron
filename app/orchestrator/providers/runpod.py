@@ -54,7 +54,6 @@ class RunPodProvider(GPUProvider):
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
-            base_url=f"{_RUNPOD_GQL_URL}?api_key={self._api_key}",
             headers={"Content-Type": "application/json"},
             timeout=30.0,
         )
@@ -64,7 +63,11 @@ class RunPodProvider(GPUProvider):
         if variables:
             payload["variables"] = variables
         async with self._client() as c:
-            resp = await c.post("", json=payload)
+            resp = await c.post(
+                _RUNPOD_GQL_URL,
+                params={"api_key": self._api_key},
+                json=payload,
+            )
             resp.raise_for_status()
             body = resp.json()
         if "errors" in body:
@@ -84,7 +87,6 @@ class RunPodProvider(GPUProvider):
                 memoryInGb
                 securePrice
                 communityPrice
-                lowestPrice { minimumBidPrice }
                 maxGpuCount
                 secureCloud
                 communityCloud
@@ -104,9 +106,6 @@ class RunPodProvider(GPUProvider):
                 price = float(gpu.get("securePrice") or 0.0)
             else:
                 price = float(gpu.get("communityPrice") or 0.0)
-                if price == 0.0:
-                    lowest = gpu.get("lowestPrice") or {}
-                    price = float(lowest.get("minimumBidPrice") or 0.0)
 
             vram_gb = float(gpu.get("memoryInGb") or 0)
             if vram_gb < settings.min_gpu_ram_gb:
@@ -147,6 +146,8 @@ class RunPodProvider(GPUProvider):
     async def create_instance(self, offer: GPUOffer, config: CreateConfig) -> str:
         from ...config import settings
 
+        worker_image = settings.runpod_worker_image or settings.worker_image
+
         env_vars = [
             {"key": "VLLM_API_KEY",                "value": config.worker_api_key},
             {"key": "MODEL_ID",                    "value": settings.model_id},
@@ -174,7 +175,7 @@ class RunPodProvider(GPUProvider):
                 "containerDiskInGb":  int(settings.worker_disk_gb),
                 "gpuTypeId":          offer.offer_id,
                 "name":               config.label,
-                "imageName":          settings.worker_image,
+                "imageName":          worker_image,
                 "env":                env_vars,
                 "ports":              "8080/http,22/tcp",
             }
@@ -197,7 +198,7 @@ class RunPodProvider(GPUProvider):
                 "containerDiskInGb":  int(settings.worker_disk_gb),
                 "gpuTypeId":          offer.offer_id,
                 "name":               config.label,
-                "imageName":          settings.worker_image,
+                "imageName":          worker_image,
                 "env":                env_vars,
                 "ports":              "8080/http,22/tcp",
             }
@@ -222,7 +223,7 @@ class RunPodProvider(GPUProvider):
                   ports { ip isIpPublic privatePort publicPort type }
                   gpus { id gpuUtilPercent memoryUtilPercent }
                 }
-                machine { podHostId gpuDisplayName gpuCount }
+                machine { podHostId gpuDisplayName }
               }
             }
             """,
@@ -242,7 +243,7 @@ class RunPodProvider(GPUProvider):
                     ports { ip isIpPublic privatePort publicPort type }
                     gpus { id }
                   }
-                  machine { podHostId gpuDisplayName gpuCount }
+                  machine { podHostId gpuDisplayName }
                 }
               }
             }
@@ -270,74 +271,162 @@ class RunPodProvider(GPUProvider):
         return False
 
     async def get_instance_logs(self, instance_id: str, tail: int = 100) -> str:
-        """RunPod does not expose a container logs API."""
-        return (
-            f"[runpod] Log retrieval is not available via the RunPod API "
-            f"for pod {instance_id!r}. Use SSH or the RunPod web console."
+        """
+        Fetch container logs via SSH (docker logs).
+
+        RunPod has no API log endpoint — SSH is the only option.
+        Requires the orchestrator public key to be registered in the RunPod
+        console under Settings → SSH Public Key.
+        """
+        import asyncssh
+        from ...config import settings
+
+        info = await self.get_instance(instance_id)
+        if not info:
+            return f"[runpod] Pod {instance_id!r} was not found on RunPod — it has likely been terminated."
+        if not info.ssh_host or not info.ssh_port:
+            return (
+                f"[runpod] SSH address not yet available for pod {instance_id!r} "
+                f"(status: {info.actual_status}). The container may still be pulling its image."
+            )
+
+        ssh_key_pem = settings.orchestrator_ssh_private_key
+        if not ssh_key_pem:
+            return (
+                f"[runpod] ORCHESTRATOR_SSH_PRIVATE_KEY is not set. "
+                "Cannot fetch logs for pod {instance_id!r} via SSH."
+            )
+
+        try:
+            ssh_key = asyncssh.import_private_key(ssh_key_pem)
+        except Exception as exc:
+            return f"[runpod] Failed to load SSH private key: {exc}"
+
+        # Grab the running container's logs; fall back to the most recently
+        # exited container if no running container is found.
+        cmd = (
+            f"cid=$(docker ps -q --filter status=running | head -1); "
+            f"[ -z \"$cid\" ] && cid=$(docker ps -aq | head -1); "
+            f"[ -n \"$cid\" ] && docker logs --tail {tail} \"$cid\" 2>&1 "
+            f"|| echo '[runpod] no container found'"
         )
+
+        try:
+            async with asyncssh.connect(
+                info.ssh_host,
+                port=info.ssh_port,
+                username="root",
+                client_keys=[ssh_key],
+                known_hosts=None,
+                connect_timeout=20,
+            ) as conn:
+                result = await conn.run(cmd, timeout=60)
+                output = (result.stdout or "") + (result.stderr or "")
+                log.info(
+                    "runpod.get_instance_logs.ok",
+                    instance_id=instance_id,
+                    bytes=len(output),
+                )
+                return output or "(no log output)"
+        except asyncssh.PermissionDenied:
+            return (
+                f"[runpod] SSH permission denied for pod {instance_id!r}. "
+                "Make sure the orchestrator public key is set in the RunPod console "
+                "under Settings → SSH Public Key."
+            )
+        except Exception as exc:
+            log.warning("runpod.get_instance_logs.failed", instance_id=instance_id, error=repr(exc))
+            return f"[runpod] Log fetch via SSH failed: {exc}"
 
     # ── SSH key management ────────────────────────────────────────────────────
+    # RunPod stores all SSH keys as a single newline-separated string in the
+    # account-level `pubKey` field (like an authorized_keys file).
+    # We parse and write it as a list so we can append / remove individual keys
+    # without clobbering keys set by other tools or in the RunPod console.
 
-    async def list_ssh_keys(self) -> list[dict[str, Any]]:
-        data = await self._gql("""
-            query { myself { publicKeys { id keyValue } } }
-        """)
-        keys = (data.get("myself") or {}).get("publicKeys") or []
-        return [{"id": k["id"], "public_key": k.get("keyValue", "")} for k in keys]
+    async def _get_pub_keys(self) -> list[str]:
+        """Return the current list of SSH public keys stored on the account."""
+        data = await self._gql("query { myself { pubKey } }")
+        raw = (data.get("myself") or {}).get("pubKey") or ""
+        return [line for line in raw.splitlines() if line.strip()]
 
-    async def add_ssh_key(self, pubkey_text: str) -> dict[str, Any]:
-        data = await self._gql(
-            """
-            mutation AddKey($input: UserPublicKeyInput!) {
-              savePublicKey(input: $input) { id keyValue }
-            }
-            """,
-            {"input": {"keyValue": pubkey_text}},
-        )
-        key = (data.get("savePublicKey") or {})
-        return {"id": key.get("id"), "public_key": key.get("keyValue", "")}
-
-    async def delete_ssh_key(self, key_id: int) -> None:
-        # RunPod key IDs are strings; the base class uses int for compatibility.
+    async def _set_pub_keys(self, keys: list[str]) -> None:
+        """Overwrite the account pubKey field with the given list of keys."""
+        # Use $pubKey: String! directly — the UpdateUserInput type name varies
+        # across RunPod API versions and causes 400 GRAPHQL_VALIDATION_FAILED.
         await self._gql(
             """
-            mutation DeleteKey($id: String!) {
-              removePublicKey(keyId: $id)
+            mutation SetPubKey($pubKey: String!) {
+              updateUserSettings(input: { pubKey: $pubKey }) { id }
             }
             """,
-            {"id": str(key_id)},
+            {"pubKey": "\n".join(keys)},
         )
+
+    async def list_ssh_keys(self) -> list[dict[str, Any]]:
+        keys = await self._get_pub_keys()
+        # Return each key as a separate entry; id is the line index so
+        # delete_ssh_key can remove the right one.
+        return [{"id": i, "public_key": k} for i, k in enumerate(keys)]
+
+    async def add_ssh_key(self, pubkey_text: str) -> dict[str, Any]:
+        new_parts = pubkey_text.split()[:2]  # [type, base64] — ignore comment
+        keys = await self._get_pub_keys()
+
+        for k in keys:
+            if k.split()[:2] == new_parts:
+                log.debug("runpod.ssh_key.already_present", pubkey_prefix=pubkey_text[:40])
+                return {"id": keys.index(k), "public_key": k}
+
+        keys.append(pubkey_text.strip())
+        await self._set_pub_keys(keys)
+        log.info("runpod.ssh_key.appended", pubkey_prefix=pubkey_text[:40], total=len(keys))
+        return {"id": len(keys) - 1, "public_key": pubkey_text}
+
+    async def delete_ssh_key(self, key_id: int) -> None:
+        keys = await self._get_pub_keys()
+        if 0 <= key_id < len(keys):
+            keys.pop(key_id)
+            await self._set_pub_keys(keys)
+            log.info("runpod.ssh_key.removed", key_id=key_id, remaining=len(keys))
 
     # ── Conversion helpers ────────────────────────────────────────────────────
 
     def _to_instance_info(self, raw: dict[str, Any]) -> InstanceInfo:
-        pod_id   = str(raw.get("id") or "")
-        status   = (raw.get("desiredStatus") or "UNKNOWN").upper()
-        runtime  = raw.get("runtime") or {}
-        machine  = raw.get("machine") or {}
+        pod_id  = str(raw.get("id") or "")
+        status  = (raw.get("desiredStatus") or "UNKNOWN").upper()
+        runtime = raw.get("runtime")   # None until the container actually starts
+        machine = raw.get("machine") or {}
 
-        actual_status = _STATE_MAP.get(status, "unknown")
+        # RunPod sets desiredStatus=RUNNING as soon as the pod is *allocated*,
+        # but `runtime` stays None while the Docker image is still being pulled.
+        # Only report actual_status="running" once the container is genuinely up.
+        base_status = _STATE_MAP.get(status, "unknown")
+        if base_status == "running" and not runtime:
+            actual_status = "pending"   # image still pulling
+        else:
+            actual_status = base_status
 
         host: Optional[str] = None
         port: Optional[int] = None
         ssh_host: Optional[str] = None
         ssh_port: Optional[int] = None
 
-        for p in runtime.get("ports") or []:
+        for p in (runtime or {}).get("ports") or []:
             private  = p.get("privatePort")
             pub_port = p.get("publicPort")
             ip       = p.get("ip") or ""
             ptype    = (p.get("type") or "").lower()
 
             if private == 8080 and "http" in ptype:
-                # RunPod HTTP proxy URL is returned in the ip field for http ports.
                 host = ip if ip else f"{pod_id}-8080.proxy.runpod.net"
                 port = 443
             elif private == 22:
                 ssh_host = ip
                 ssh_port = pub_port
 
-        # Construct proxy URL if pod is running but ports not yet reported.
+        # Once the container is running and runtime is present, expose the proxy
+        # URL even if RunPod hasn't populated the ports list yet.
         if host is None and actual_status == "running":
             host = f"{pod_id}-8080.proxy.runpod.net"
             port = 443

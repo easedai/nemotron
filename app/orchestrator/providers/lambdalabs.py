@@ -226,15 +226,22 @@ class LambdaLabsProvider(GPUProvider):
         # offer_id encodes "region:instance_type_name"
         region, instance_type_name = offer.offer_id.split(":", 1)
 
+        # Lambda Labs VMs run Docker via cloud-init.  Use the generic image
+        # (plain ENTRYPOINT, no vastai supervisor) unless overridden.
+        worker_image = (
+            settings.lambdalabs_worker_image
+            or "ghcr.io/easedai/nemotron:latest"
+        )
+
         user_data = _make_user_data(
             worker_api_key              =config.worker_api_key,
             model_id                    =settings.model_id,
             vllm_max_model_len          =settings.vllm_max_model_len,
             vllm_gpu_memory_utilization =settings.vllm_gpu_memory_utilization,
             vllm_video_loader_backend   =settings.vllm_video_loader_backend,
-            hf_home                     =settings.hf_home,
-            vllm_cache_root             =settings.vllm_cache_root,
-            worker_image                =settings.worker_image,
+            hf_home                     ="/hf",   # generic image bakes HF_HOME=/hf
+            vllm_cache_root             ="/vllm-cache",
+            worker_image                =worker_image,
         )
 
         body: dict[str, Any] = {

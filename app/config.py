@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from pydantic import computed_field
 from pydantic_settings import BaseSettings
 
 
@@ -9,8 +10,13 @@ class Settings(BaseSettings):
     # ── Provider selection ────────────────────────────────────────────────────
     # One or more GPU providers, comma-separated.  Each name must match a key
     # registered in app/orchestrator/providers/__init__.py.
-    # Example: "vastai" or "vastai,salad"
+    # Example: PROVIDERS=vastai or PROVIDERS=vastai,salad
     providers: str = "vastai"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def provider_list(self) -> list[str]:
+        return [p.strip() for p in self.providers.split(",") if p.strip()]
 
     # ── vast.ai ──────────────────────────────────────────────────────────────
     # Required for the orchestrator; also used by the LB's /admin/terminate.
@@ -114,18 +120,28 @@ class Settings(BaseSettings):
 
     # ── RunPod ───────────────────────────────────────────────────────────────
     runpod_api_key: Optional[str] = None
+    # Override the worker image for RunPod pods.  Defaults to worker_image.
+    # RunPod-optimised image: ghcr.io/easedai/nemotron-runpod:latest
+    runpod_worker_image: Optional[str] = None
 
     # ── Lambda Labs ───────────────────────────────────────────────────────────
     lambdalabs_api_key:      Optional[str] = None
     # Name of a pre-registered SSH key in Lambda Labs to attach to new instances.
     # Register via Lambda Labs console → SSH Keys, then set this to the key name.
     lambdalabs_ssh_key_name: Optional[str] = None
+    # Worker image pulled via cloud-init docker run on the Lambda Labs VM.
+    # Defaults to the generic image (ghcr.io/easedai/nemotron:latest).
+    # Do NOT use the vastai image here — it requires vast.ai's supervisor boot chain.
+    lambdalabs_worker_image: Optional[str] = None
 
     # ── TensorDock ────────────────────────────────────────────────────────────
     tensordock_api_key: Optional[str] = None
     tensordock_org_id:  Optional[str] = None
     # RAM (GB) to allocate per VM; 32 GB is sufficient for Nemotron-Nano-12B.
     tensordock_ram_gb:  int           = 32
+    # Worker image pulled via cloud-init docker run on the TensorDock VM.
+    # Defaults to the generic image (ghcr.io/easedai/nemotron:latest).
+    tensordock_worker_image: Optional[str] = None
 
     # ── Salad ────────────────────────────────────────────────────────────────
     salad_api_key:            Optional[str] = None
