@@ -2,7 +2,7 @@ name: Build & push qwen3-vl worker image
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
     paths:
       - "qwen3-vl/**"
       - ".github/workflows/build-qwen3-vl.yml"
