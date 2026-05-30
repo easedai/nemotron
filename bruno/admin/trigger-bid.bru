@@ -1,0 +1,15 @@
+meta {
+  name: Trigger Bid Campaign
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{base_url}}/admin/bid
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{admin_token}}
+}

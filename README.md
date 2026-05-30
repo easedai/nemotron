@@ -1,93 +1,414 @@
-# nemotron-worker
+# eased — GPU Worker Orchestrator
 
-Public Docker image for the [eased](https://github.com/easedai/eased) GPU worker.
-Bakes **Nvidia Nemotron** weights into the image so vast.ai instances need no
-separate model download on cold start.
+Agentic orchestrator that rents cheap GPU servers on [vast.ai](https://vast.ai), bakes
+model weights into a Docker image, and proxies OpenAI-compatible vLLM requests through
+a single stable endpoint. Production deployment runs on **ECS Fargate Spot** (no GPU
+required). Worker nodes run on vast.ai interruptible instances, with automatic on-demand
+fallback.
 
-Built from `vllm/vllm-openai:latest`. Workflow: `build.yml`.
-
----
-
-## Supported models
-
-| Model | HuggingFace ID | Weights | Tag |
-|---|---|---|---|
-| Nemotron Nano 12B VL BF16 | `nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16` | ~24 GB | `12b-vl-bf16` / `latest` |
+The orchestrator is built around a **`GPUProvider` abstraction** (`app/orchestrator/providers/`)
+so additional GPU marketplaces (RunPod, TensorDock, etc.) can be added without modifying
+the core orchestration logic.
 
 ---
 
-## Image contents
+## Architecture
 
-| Layer | Size |
+```
+Client
+  │  HTTPS
+  ▼
+API Gateway  ──►  Lambda Authorizer (Bearer token)
+  │
+  ▼
+ECS Fargate Spot ┬── Orchestrator  (background worker, no HTTP)
+                 │     manages GPU instances via GPUProvider interface
+                 │     ├── VastAIProvider (default)
+                 │     └── <future providers>
+                 │
+                 └── Load Balancer (FastAPI, port 8000)
+                       /v1/* proxy + /admin/* + /health + /workers
+
+  GPU workers: vast.ai interruptible (bid) + on-demand fallback
+  State:  AWS DynamoDB  (worker records survive restarts)
+  Alerts: Discord webhook
+```
+
+### Service layout
+
+Two containers, one shared `app/` package:
+
+| Service | Role | Entry point |
+|---|---|---|
+| `orchestrator` | Background worker — bids for GPU instances, monitors health, manages lifecycle | `python -m app.orchestrator.main` |
+| `load-balancer` | HTTP API — round-robin proxy to vLLM workers, `/admin/*`, `/health` | `uvicorn app.lb.main:app` |
+
+### Orchestrator responsibilities
+
+| Concern | Behaviour |
 |---|---|
-| vLLM base | ~15 GB |
-| Nemotron Nano 12B VL BF16 weights | ~24 GB |
-| **Total** | **~40 GB** |
+| **Bidding** | Starts at 50 % of median market price; retries every 5 min at +5 % until filled or cap (110 %) is hit |
+| **On-demand fallback** | Cold-starts one on-demand worker only when no interruptible worker exists |
+| **Outbid recovery** | When preempted, first tries `change_bid` API to raise the bid on the existing instance before falling back to a new campaign |
+| **Health checking** | Pings `/health` every 30 s; marks worker UNHEALTHY on first failure, TERMINATED after 3 consecutive failures |
+| **Provider sync** | Every 60 s cross-checks DynamoDB workers against live provider instances; detects reclaimed/orphaned instances |
+| **Startup discovery** | On start, scans the provider for owned instances not in DynamoDB and registers them (prevents redundant bids after a DB wipe) |
+| **Orphan cleanup** | Destroys instances with our label or image that have no DB record |
+| **Recovery** | Destroys the failed instance, starts a new bid campaign automatically |
+| **State persistence** | DynamoDB — survives Fargate task restarts |
+| **Notifications** | Discord webhook for every meaningful lifecycle event + periodic fleet status reports (every 30 min) |
+| **Cost tracking** | Tracks per-instance running time and cost; reported in periodic Discord summaries and `/admin/health` |
+| **SSH log access** | Injects an Ed25519 public key into every new instance so it can SSH in to tail `/tmp/vllm.log` during startup |
+
+### Worker image
+
+`ghcr.io/easedai/nemotron:latest` — built and published by the
+[`build-worker.yml`](.github/workflows/build-worker.yml) workflow in this repo.
+Bakes the full Nemotron Nano 12B BF16 weights into the vLLM base image.
+
+- **Size**: ~40 GB (vLLM base ~15 GB + model ~24 GB)
+- **Cold start**: ~5–10 min (image pull on a fresh vast.ai host) + model load
+- **Warm start** (same host, layer-cached): model load only (~5 min)
+- **Security**: `VLLM_API_KEY` is generated per-instance by the orchestrator and
+  injected via vast.ai environment variables — never hardcoded
+- **vLLM patches**: Six patches for vLLM 0.19.0 / `NanoNemotronVLProcessor` compatibility are baked
+  into the image at build time via `patch_vllm.py` (see `nemotron/patch_vllm.py` for details):
+  1. `encoder_budget.py` — `get_dummy_mm_inputs` crash; falls back to `max_model_len` per modality
+  2. `transformers_utils/processor.py` — missing `_merge_kwargs`; falls back to distributing common kwargs
+  3. `v1/worker/gpu_model_runner.py` — `_get_mm_dummy_batch` crash; skips encoder profiling on failure
+  4. `nano_nemotron_vl.py` — `video_num_patches` bounds check during dummy profiling
+  5. `nano_nemotron_vl.py` — EVS pruning `None` guard when `num_tubelets` is absent
+  6. `chat_completion/protocol.py` — `set_include_reasoning_for_none_effort` list input guard
+- **CUDA 13.0 required**: The worker image uses `vLLM 0.19.0+cu130` (PyTorch built for CUDA 13.0).
+  The orchestrator filters offers to hosts with `cuda_max_good >= 13.0` (driver ≥ 575).
+  Hosts with driver 560.x (CUDA 12.6) crash on `torch._C._cuda_init()` before loading the model.
 
 ---
 
-## Runtime environment variables
+## Local development
 
-Injected by the eased orchestrator at launch time via vast.ai:
+### Prerequisites
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `VLLM_API_KEY` | Yes | — | Per-instance Bearer token generated by the orchestrator |
-| `MODEL_PATH` | No | `/root/.cache/huggingface/nemotron-nano-12b-vl-bf16` | Path to baked-in model weights |
-| `VLLM_MAX_MODEL_LEN` | No | `4096` | Maximum sequence length in tokens |
-| `VLLM_GPU_MEMORY_UTILIZATION` | No | `0.95` | Fraction of GPU VRAM to use |
+- Docker + Docker Compose v2
+- A [vast.ai](https://vast.ai) account and API key
+- An AWS account with DynamoDB access (via SSO profile)
+- A Discord webhook URL
 
----
-
-## vLLM 0.19.0 patches
-
-vLLM 0.19.0 has five crash sites in the multimodal dummy-input profiling path
-that prevent `NanoNemotronVLProcessor`-based models from starting. The image
-applies [`patch_vllm.py`](patch_vllm.py) at build time to fix all five:
-
-| # | File | Bug | Fix |
-|---|------|-----|-----|
-| 1 | `encoder_budget.py` | `get_dummy_mm_inputs` raises during profiling | try/except fallback to `max_model_len` per modality |
-| 2 | `transformers_utils/processor.py` | `_merge_kwargs` missing on `NanoNemotronVLProcessor` | `hasattr` guard with manual kwarg routing |
-| 3 | `gpu_model_runner.py` | `_get_mm_dummy_batch` raises during encoder profiling | try/except, skip profiling (first real request warms up) |
-| 4 | `nano_nemotron_vl.py` | `video_num_patches[item_idx]` IndexError on empty list | bounds check, return `None` when out of range |
-| 5 | `nano_nemotron_vl.py` | `num_tubelets=None` propagates to EVS pruning (`int * None`) | `None` guard on pruning condition + fallback using frame count |
-
-All patches are idempotent — they skip silently if already applied or if the
-target code has changed in a newer vLLM release.
-
----
-
-## Building locally
+### Quick start
 
 ```bash
+cd eased
+cp .env.example .env
+# Edit .env — fill in VASTAI_API_KEY, DISCORD_WEBHOOK_URL, ADMIN_TOKEN, and AWS_PROFILE at minimum
+# Generate ADMIN_TOKEN with: openssl rand -hex 32
+
+# Authenticate your AWS SSO session (DynamoDB runs in real AWS, not locally)
+aws sso login --profile <your-profile>
+
+docker compose up --build
+```
+
+Two containers start:
+- **orchestrator** — background worker that bids for GPU instances and monitors health (no HTTP port)
+- **load-balancer** — HTTP API at **http://localhost:8000** with hot-reload enabled
+
+AWS credentials are mounted from `~/.aws` — both containers use your host SSO session.
+
+On startup the orchestrator will scan vast.ai for any existing instances it owns,
+register them in DynamoDB, and then only bid for a new worker if none are found.
+
+### API endpoints
+
+All endpoints are served by the **load-balancer** on port 8000.
+
+| Endpoint | Auth | Description |
+|---|---|---|
+| `GET  /health` | None | Basic liveness probe — returns status + uptime |
+| `GET  /workers` | None | List all workers currently in the LB pool |
+| `GET  /admin/health` | Bearer | Detailed fleet health: worker counts, per-instance cost, spend rate |
+| `GET  /admin/workers` | Bearer | List all workers and their full state |
+| `POST /admin/workers/{id}/terminate` | Bearer | Destroy a specific worker |
+| `GET  /admin/events/worker/{worker_id}` | Bearer | Event history for a worker |
+| `GET  /admin/events/instance/{instance_id}` | Bearer | Event history for a provider instance |
+| `GET  /admin/events/label/{label}` | Bearer | Event history by instance label (e.g. `eased-abc123`) |
+| `GET  /v1/models` | — | Proxied to the active vLLM worker |
+| `POST /v1/chat/completions` | — | Proxied to the active vLLM worker |
+
+All `/admin/*` endpoints require `Authorization: Bearer <ADMIN_TOKEN>`.
+
+### Bruno collection
+
+A [Bruno](https://www.usebruno.com/) API collection is included in `bruno/`.
+
+```bash
+# Open in Bruno desktop app
+# Select the "Local" environment (pre-configured with base_url + admin_token)
+```
+
+---
+
+## Worker states
+
+```
+BIDDING → PENDING → STARTING → RUNNING
+                                  │
+                         (health check fail × 1)
+                                  │
+                              UNHEALTHY
+                                  │
+                         (health check fail × 3 total)
+                                  │
+                             TERMINATED → (new bid campaign)
+```
+
+| State | Description |
+|---|---|
+| `BIDDING` | Searching for a GPU offer and placing bids |
+| `PENDING` | vast.ai instance created; waiting for container to start |
+| `STARTING` | Container running; waiting for vLLM `/health` to return 200 |
+| `RUNNING` | vLLM is serving traffic |
+| `UNHEALTHY` | Health check failing; traffic paused; watching for recovery |
+| `DRAINING` | Worker is being gracefully wound down (not yet terminated) |
+| `TERMINATED` | Worker is dead; triggers a new bid campaign if pool is empty |
+
+---
+
+## Building the worker image
+
+### Locally
+
+```bash
+cd eased/worker
+
+# HF_TOKEN must be exported or set inline
 DOCKER_BUILDKIT=1 docker build \
   --secret id=HF_TOKEN,env=HF_TOKEN \
-  -t ghcr.io/<org>/nemotron:12b-vl-bf16 \
+  -t ghcr.io/easedai/nemotron:latest \
   .
 ```
 
-`HF_TOKEN` must have read access to the gated Nemotron models on HuggingFace. It is
-passed as a BuildKit secret and is **never** written into any image layer.
+The HuggingFace token is passed as a BuildKit secret — it is **never** embedded in
+any image layer and will not appear in `docker history`.
+
+### Via GitHub Actions
+
+The `build-worker.yml` workflow runs on standard `ubuntu-latest` runners.
+Registry-based layer caching (`type=registry`) is used so the ~24 GB model layer
+survives between runs without hitting the 10 GB GitHub Actions cache limit.
+
+**Required GitHub secrets:**
+
+| Secret | Value |
+|---|---|
+| `HF_TOKEN` | HuggingFace token with access to the gated Nemotron model |
+| `GITHUB_TOKEN` | Auto-provisioned — no action needed |
+
+### Orchestrator CI/CD (`build-orchestrator.yml`)
+
+Runs on `ubuntu-latest`. On every push to `main` that touches `orchestrator/` or
+`terraform/`, it:
+
+1. Builds and pushes `ghcr.io/easedai/eased-orchestrator:sha-<sha>` to GHCR
+2. Runs `terraform apply` via the pinned SHA tag — ensuring the ECS service always
+   runs exactly the just-built image
+
+**Required GitHub secrets for orchestrator CI:**
+
+| Secret | Value |
+|---|---|
+| `AWS_ACCESS_KEY_ID` | AWS credentials for Terraform |
+| `AWS_SECRET_ACCESS_KEY` | AWS credentials for Terraform |
+| `TF_VAR_VASTAI_API_KEY` | vast.ai API key |
+| `TF_VAR_DISCORD_WEBHOOK_URL` | Discord webhook URL |
+| `TF_VAR_HF_TOKEN` | HuggingFace token (stored in Secrets Manager by Terraform) |
+| `TF_VAR_AUTHORIZER_TOKEN` | API Gateway Lambda authorizer token |
+| `TF_VAR_GHCR_PAT` | GitHub PAT (read:packages) for ECS to pull the private orchestrator image |
 
 ---
 
-## GitHub Actions
+## GPU provider options
 
-### `build.yml`
+The orchestrator uses a `GPUProvider` abstraction (`app/orchestrator/providers/`) to
+normalize offers and instances across providers.  Adding a new marketplace requires only:
 
-Triggers on push to `main` touching `Dockerfile`, `entrypoint.sh`, `patch_vllm.py`,
-or `build.yml`. Runs on `ubuntu-latest` after disk cleanup (~54 GB free, sufficient
-for the 12B image).
+1. Create `app/orchestrator/providers/<name>.py` implementing `GPUProvider`
+2. Register it in `app/orchestrator/providers/__init__.py` → `get_provider()`
+3. Set the `PROVIDER` env var (not yet wired; defaults to `"vastai"`)
 
-Tags pushed: `12b-vl-bf16`, `12b-vl-bf16-sha-<sha>`, `latest` (on main).
+The normalized types (`GPUOffer`, `InstanceInfo`, `CreateConfig`) shield
+`worker_manager.py` from provider-specific API details.
 
-### `build-vastai.yml`
+### Marketplace / spot (similar model to vast.ai)
 
-Disabled (no push trigger). Kept for reference only.
-
-### Required repository secret
-
-| Secret | Description |
+| Provider | Notes |
 |---|---|
-| `HF_TOKEN` | HuggingFace token with access to the gated Nemotron models |
+| [RunPod](https://runpod.io) | Most similar to vast.ai — spot pods, REST API, active supply. Easiest next integration. |
+| [TensorDock](https://tensordock.com) | GPU marketplace, similar bidding model, often cheaper |
+| [Salad.com](https://salad.com) | Distributed consumer GPUs, very cheap, less reliable uptime |
+| [FluidStack](https://fluidstack.io) | GPU marketplace with preemptible instances |
+
+### Dedicated cloud (more stable, higher cost)
+
+| Provider | Notes |
+|---|---|
+| [Lambda Labs](https://lambdalabs.com) | H100 / A100 clusters, REST API, on-demand only |
+| [CoreWeave](https://coreweave.com) | Kubernetes-native, best H100 availability, enterprise focus |
+| [Hyperstack](https://hyperstack.cloud) | NVIDIA cloud, competitive H100 pricing |
+| [DataCrunch](https://datacrunch.io) | European, A100 / H100, spot + on-demand |
+
+### Aggregators (single API across multiple providers)
+
+| Provider | Notes |
+|---|---|
+| [Shadeform](https://shadeform.ai) | One API across CoreWeave, Lambda, RunPod, and others |
+| [Brev.dev](https://brev.dev) | Similar aggregator model |
+
+---
+
+## Bidding strategy
+
+The orchestrator queries the vast.ai marketplace for all interruptible GPU offers with:
+- ≥ 40 GB VRAM (A100 40 GB is the practical minimum for useful context lengths)
+- ≥ 100 GB disk
+- ≥ 300 Mbps download
+- ≥ 90 % reliability rating
+- CUDA compute capability ≥ SM 7.5 (Turing / T4+); SM 7.0 (V100) crashes with `cudaErrorNoKernelImageForDevice`
+- CUDA version ≥ 13.0 (`cuda_max_good`); older drivers crash on `torch._C._cuda_init()` with the cu130 image
+- **North America only** (US and Canada datacenters)
+
+The **market price** is defined as the median `dph_base` across all matching offers.
+
+| Attempt | Bid | Behaviour |
+|---|---|---|
+| 1 | 50 % of market | Wait 5 min |
+| 2 | 55 % of market | Wait 5 min |
+| 3 | 60 % of market | Wait 5 min |
+| … | … | … |
+| Cap | > 110 % of market | Fall back to on-demand |
+
+The winning multiplier from the previous campaign is remembered — the next campaign
+starts one step below it to probe whether a cheaper bid will land.
+
+All thresholds are configurable via environment variables (see below).
+
+---
+
+## Production deployment (ECS Fargate Spot)
+
+The orchestrator is stateless (state lives in DynamoDB) and runs without a GPU,
+making it a perfect fit for Fargate Spot.
+
+All AWS infrastructure is managed by Terraform in `terraform/`. The `build-orchestrator.yml`
+workflow runs `terraform apply` automatically on each deploy. Resources provisioned:
+
+- API Gateway HTTP API + Lambda authorizer (Bearer token)
+- ECS Fargate Spot cluster + service (0.5 vCPU / 1 GB)
+- DynamoDB tables: `eased-workers` and `eased-instance-events` (7-day TTL)
+- VPC, subnets, security groups, IAM roles
+- AWS Secrets Manager secrets: vast.ai API key, admin token, Discord webhook, SSH private key, GHCR PAT
+- CloudWatch log group (30-day retention)
+- SSH key pair (Ed25519) in `ssh_keys.tf` — stable across task restarts
+
+The orchestrator's SSH private key (`ORCHESTRATOR_SSH_PRIVATE_KEY`) is injected at
+container start from Secrets Manager. Using a stable key avoids re-uploading keys to
+vast.ai on every Fargate task restart.
+
+---
+
+## Environment variables reference
+
+### Required
+
+| Variable | Description |
+|---|---|
+| `VASTAI_API_KEY` | vast.ai API key |
+| `DISCORD_WEBHOOK_URL` | Discord webhook for alerts |
+| `ADMIN_TOKEN` | Bearer token for `/admin/*` endpoints. Generate with `openssl rand -hex 32` |
+
+### Worker image
+
+| Variable | Default | Description |
+|---|---|---|
+| `WORKER_IMAGE` | `easedai/nemotron-vastai:latest` | Docker Hub image for the worker |
+| `WORKER_DISK_GB` | `100.0` | Disk space (GB) to request for each worker instance |
+| `GHCR_USERNAME` | — | GitHub username/org for private GHCR image pull |
+| `GHCR_PAT` | — | GitHub PAT (read:packages) for private GHCR image pull |
+
+### Model / vLLM
+
+| Variable | Default | Description |
+|---|---|---|
+| `MODEL_ID` | `nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16` | HuggingFace model ID passed to vLLM |
+| `HF_HOME` | `/hf` | HuggingFace cache dir — must match the path baked into the worker image |
+| `HF_HUB_ENABLE_HF_TRANSFER` | `1` | Enable fast HF transfers (hf_transfer) |
+| `VLLM_CACHE_ROOT` | `/vllm-cache` | vLLM compiled Triton kernel / torch.compile cache |
+| `VLLM_PORT` | `8080` | Container port vLLM listens on |
+| `VLLM_MAX_MODEL_LEN` | `32768` | Context length. Use `131072` only with ≥ 80 GB VRAM |
+| `VLLM_GPU_MEMORY_UTILIZATION` | `0.95` | Fraction of GPU VRAM reserved for vLLM |
+| `VLLM_VIDEO_LOADER_BACKEND` | `opencv` | Required for `--video-pruning-rate` (do not change) |
+
+### vast.ai template
+
+| Variable | Default | Description |
+|---|---|---|
+| `VASTAI_TEMPLATE_ID` | — | Pre-existing template hash_id to use (skips template creation) |
+| `VASTAI_TEMPLATE_NAME` | `eased-nemotron` | Name of the template the orchestrator creates/looks up |
+
+### AWS / DynamoDB
+
+| Variable | Default | Description |
+|---|---|---|
+| `DYNAMODB_TABLE` | `eased-workers` | DynamoDB worker state table |
+| `EVENTS_TABLE` | `eased-instance-events` | Instance event log table (7-day TTL) |
+| `DYNAMODB_ENDPOINT_URL` | AWS | Override for local dev (set automatically by docker-compose) |
+| `AWS_REGION` | `us-east-1` | AWS region |
+
+### Bidding
+
+| Variable | Default | Description |
+|---|---|---|
+| `BID_START_PCT` | `0.50` | Starting bid as fraction of market |
+| `BID_STEP_PCT` | `0.05` | Increment per retry |
+| `BID_RETRY_INTERVAL_SEC` | `300` | Seconds between retries |
+| `BID_MAX_MULTIPLIER` | `1.10` | Fallback threshold (> market × this triggers on-demand) |
+
+### GPU requirements
+
+| Variable | Default | Description |
+|---|---|---|
+| `MIN_GPU_RAM_GB` | `40` | Minimum GPU VRAM (GB) |
+| `MIN_DISK_GB` | `100` | Minimum instance disk (GB) |
+| `MIN_INET_DOWN_MBPS` | `300` | Minimum download speed (Mbps) |
+| `MIN_RELIABILITY` | `0.90` | Minimum host reliability score |
+| `MIN_COMPUTE_CAP` | `750` | Minimum CUDA compute capability (vast.ai integer format: 750 = SM 7.5). SM 7.0 (V100) crashes with `cudaErrorNoKernelImageForDevice`. |
+| `MIN_CUDA_VERSION` | `13.0` | Minimum CUDA version (`cuda_max_good`). The worker image uses `vLLM+cu130`; hosts with driver 560.x (CUDA 12.6) crash before loading the model. |
+
+### Health checking
+
+| Variable | Default | Description |
+|---|---|---|
+| `HEALTH_CHECK_INTERVAL_SEC` | `30` | Worker HTTP ping interval |
+| `HEALTH_CHECK_TIMEOUT_SEC` | `10` | Per-request timeout for health pings |
+| `HEALTH_CHECK_FAIL_THRESHOLD` | `3` | Consecutive failures before termination |
+| `WORKER_STARTUP_TIMEOUT_SEC` | `900` | Max wait for vLLM to become healthy (15 min) |
+| `VAST_CHECK_INTERVAL_SEC` | `60` | How often to cross-check against vast.ai instance list |
+| `STATUS_REPORT_INTERVAL_SEC` | `1800` | How often to post fleet status to Discord (30 min) |
+
+### Instance limits
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_INSTANCES` | `1` | Maximum number of operational worker instances |
+| `KEEP_DEBUG_INSTANCE` | `false` | When `true`, failed instances are kept alive for SSH inspection instead of being destroyed (at most 1 debug slot; set `false` in production) |
+
+### SSH
+
+| Variable | Default | Description |
+|---|---|---|
+| `ORCHESTRATOR_SSH_PRIVATE_KEY` | — | OpenSSH Ed25519 private key injected by ECS from Secrets Manager. When set, the orchestrator uses this stable key instead of generating an ephemeral one at startup. Leave unset for local dev. |
+
+### Logging
+
+| Variable | Default | Description |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING`. `DEBUG` uses human-readable console output; all other levels emit JSON. |

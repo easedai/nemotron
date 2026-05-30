@@ -1,0 +1,41 @@
+services:
+  qwen3-vl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/${GHCR_ORG:-myorg}/qwen3-vl:latest
+    ports:
+      - "${PORT:-8001}:${PORT:-8001}"
+    volumes:
+      # Mount your LoRA checkpoint directory here.
+      # Must contain adapter_config.json + adapter_model.safetensors.
+      - ${ADAPTER_PATH:-./adapters/checkpoint}:/adapters/checkpoint:ro
+      # Cache base model weights between restarts.
+      - hf-cache:/models/hf
+    environment:
+      API_KEY: ${API_KEY:?API_KEY is required}
+      HF_TOKEN: ${HF_TOKEN:-}
+      BASE_MODEL: ${BASE_MODEL:-Qwen/Qwen3-VL-8B-Instruct}
+      ADAPTER_PATH: ${ADAPTER_MOUNT:-/adapters/checkpoint}
+      ADAPTER_NAME: ${ADAPTER_NAME:-}
+      PORT: ${PORT:-8001}
+      LOAD_IN_4BIT: ${LOAD_IN_4BIT:-}
+      LOAD_IN_8BIT: ${LOAD_IN_8BIT:-}
+      NO_MERGE: ${NO_MERGE:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:${PORT:-8001}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+
+volumes:
+  hf-cache:

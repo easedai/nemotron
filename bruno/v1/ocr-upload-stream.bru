@@ -1,0 +1,75 @@
+meta {
+  name: OCR - Upload Image (Streaming)
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{base_url}}/v1/chat/completions
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+vars:pre-request {
+  image_path: /path/to/your/image.png
+}
+
+script:pre-request {
+  // Read a local image file, base64-encode it, and build a data URL.
+  // Change image_path above (or set it in your environment) to point at your file.
+  const fs   = require('fs');
+  const path = require('path');
+
+  // Prefer the environment-level image_path so you only set it once.
+  const imagePath = bru.getEnvVar('image_path') || bru.getVar('image_path');
+
+  if (!imagePath || imagePath === '/path/to/your/image.png') {
+    throw new Error('Set image_path in your environment (or in vars:pre-request) to an absolute path, e.g. /home/user/receipt.png');
+  }
+
+  const ext = path.extname(imagePath).toLowerCase().replace('.', '');
+  const mimeTypes = {
+    png:  'image/png',
+    jpg:  'image/jpeg',
+    jpeg: 'image/jpeg',
+    webp: 'image/webp',
+    gif:  'image/gif',
+    bmp:  'image/bmp',
+    tiff: 'image/tiff',
+    tif:  'image/tiff',
+  };
+  const mime = mimeTypes[ext] || 'image/png';
+
+  const b64 = fs.readFileSync(imagePath).toString('base64');
+  bru.setVar('image_data_url', `data:${mime};base64,${b64}`);
+}
+
+body:json {
+  {
+    "model": "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "{{image_data_url}}"
+            }
+          },
+          {
+            "type": "text",
+            "text": "Perform OCR on this image. Extract all text exactly as it appears, preserving the original layout, line breaks, and formatting as closely as possible. Return only the extracted text with no commentary."
+          }
+        ]
+      }
+    ],
+    "max_tokens": 2048,
+    "temperature": 0,
+    "stream": true
+  }
+}

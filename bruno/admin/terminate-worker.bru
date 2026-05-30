@@ -1,0 +1,19 @@
+meta {
+  name: Terminate Worker
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{base_url}}/admin/workers/{{worker_id}}/terminate
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{admin_token}}
+}
+
+vars {
+  worker_id: replace-me
+}

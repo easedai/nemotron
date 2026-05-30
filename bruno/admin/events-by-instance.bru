@@ -1,0 +1,19 @@
+meta {
+  name: Events by Instance ID
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{base_url}}/admin/events/instance/{{instance_id}}?limit=100
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{admin_token}}
+}
+
+vars {
+  instance_id: replace-me
+}

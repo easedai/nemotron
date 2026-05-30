@@ -1,0 +1,114 @@
+# ── Local development stack ────────────────────────────────────────────────────
+#
+# Services:
+#   redis           Worker queue — round-robin pool + lease tracking
+#   orchestrator    Background worker — manages GPU workers (no HTTP)
+#   load-balancer   HTTP API — /v1/* proxy + /admin/* + /ui + /health
+#   tailscale       Overlay network — shares LB's network namespace so the LB
+#                   is reachable on your tailnet as http://<TS_HOSTNAME>:8000
+#
+# Usage:
+#   cp .env.example .env
+#   aws sso login --profile <your-profile>
+#   docker compose up --build
+#
+# Admin UI:  http://localhost:8000/ui  (or http://scale:8000/ui on tailnet)
+# Tailscale: generate an auth key at https://login.tailscale.com/admin/settings/keys
+#            Use "Ephemeral + Pre-authorized".  Set TS_AUTHKEY in .env.
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    env_file: .env
+    environment:
+      LOG_LEVEL: DEBUG
+      AWS_DEFAULT_REGION: us-east-1
+      ORCHESTRATOR_ID: local
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./app:/app/app
+      - ${HOME}/.aws:/root/.aws
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  load-balancer:
+    build:
+      context: .
+      dockerfile: Dockerfile.lb
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      LOG_LEVEL: DEBUG
+      AWS_DEFAULT_REGION: us-east-1
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./app:/app/app
+      - ${HOME}/.aws:/root/.aws
+    command: >
+      uvicorn app.lb.main:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+        --reload-include "*.py"
+        --log-level debug
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Tailscale ──────────────────────────────────────────────────────────────
+  # Shares the load-balancer's network namespace so the LB is directly reachable
+  # on your tailnet at http://<TS_HOSTNAME>:8000 (and /ui for the admin panel).
+  #
+  # Required in .env:
+  #   TS_AUTHKEY=tskey-auth-...    # Ephemeral + Pre-authorized key
+  #   TS_HOSTNAME=scale            # How it appears in your tailnet
+  #
+  # Optional:
+  #   TS_EXTRA_ARGS=--accept-dns=false
+  tailscale:
+    image: tailscale/tailscale:latest
+    network_mode: service:load-balancer   # attach to LB's netns — same IP, same ports
+    environment:
+      TS_AUTHKEY:      ${TS_AUTHKEY:-}
+      TS_HOSTNAME:     ${TS_HOSTNAME:-scale}
+      TS_STATE_DIR:    /var/lib/tailscale
+      TS_EXTRA_ARGS:   ${TS_EXTRA_ARGS:---accept-dns=false}
+      # HTTPS via tailscale serve — terminates TLS and proxies to the LB.
+      # Requires HTTPS certificates enabled in your Tailscale admin console
+      # (admin.tailscale.com → DNS → Enable HTTPS certificates).
+      # Leave blank to serve plain HTTP only.
+      TS_SERVE_CONFIG: ${TS_SERVE_CONFIG:-/config/serve.json}
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+      - ./tailscale-serve.json:/config/serve.json:ro
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    depends_on:
+      - load-balancer
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  tailscale-state:

@@ -1,0 +1,39 @@
+meta {
+  name: Chat Completion (Vision)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{base_url}}/v1/chat/completions
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "model": "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png"
+            }
+          },
+          {
+            "type": "text",
+            "text": "What is in this image?"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 512
+  }
+}
