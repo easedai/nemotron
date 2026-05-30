@@ -2,15 +2,19 @@ name: Build & push qwen3-vl worker image
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
     paths:
       - "qwen3-vl/**"
       - ".github/workflows/build-qwen3-vl.yml"
   # Manual trigger — optionally bake an adapter into the image at build time.
   workflow_dispatch:
     inputs:
+      base_model:
+        description: "HuggingFace model ID to bake in (default: Qwen/Qwen3-VL-8B-Instruct)"
+        required: false
+        default: "Qwen/Qwen3-VL-8B-Instruct"
       adapter_url:
-        description: "HTTPS URL to a .zip or .tar.gz LoRA adapter archive (leave blank to skip)"
+        description: "HTTPS URL or HuggingFace Hub ID for a LoRA adapter archive (leave blank to skip)"
         required: false
         default: ""
       adapter_name:
@@ -65,7 +69,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
+            BASE_MODEL=${{ inputs.base_model || 'Qwen/Qwen3-VL-8B-Instruct' }}
             ADAPTER_URL=${{ inputs.adapter_url }}
             ADAPTER_NAME=${{ inputs.adapter_name }}
+          secrets: |
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
           cache-from: type=gha
           cache-to:   type=gha,mode=max

@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+#
+# Vast.ai image: uses vastai/vllm base so Vast.ai hosts can reuse pre-cached
+# base layers. Supervisor manages vLLM with auto-restart.
+# The base model is downloaded from HuggingFace at first startup (not baked in,
+# since the adapter checkpoint is mounted at runtime anyway).
+#
+# Build:
+#   docker build \
+#     -f Dockerfile.vastai \
+#     -t ghcr.io/<org>/qwen3-vl:vastai-latest .
+#
+# Then set WORKER_IMAGE=ghcr.io/<org>/qwen3-vl:vastai-latest in eased/.env.
+
+FROM vastai/vllm:latest
+
+ENV HF_HOME=/models/hf
+ENV VLLM_CACHE_ROOT=/models/vllm-cache
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
+ENV PYTHONUNBUFFERED=1
+
+# Create directories; /adapters is the expected mount point for the checkpoint.
+RUN mkdir -p /models/hf /models/vllm-cache /adapters/checkpoint
+
+# Supervisor service definition.
+COPY vllm.conf /etc/supervisor/conf.d/vllm.conf
+COPY vllm.sh /opt/supervisor-scripts/vllm.sh
+RUN chmod +x /opt/supervisor-scripts/vllm.sh
+
+# Vast.ai onstart hook (runs instead of ENTRYPOINT on ssh_direc/ssh_proxy type).
+RUN ln -sf /opt/instance-tools/bin/entrypoint.sh /entrypoint.sh
+COPY onstart.sh /root/onstart.sh
+RUN chmod +x /root/onstart.sh
+
+EXPOSE 8001
