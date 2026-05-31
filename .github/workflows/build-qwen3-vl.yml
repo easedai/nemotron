@@ -59,7 +59,7 @@ jobs:
             type=raw,value=${{ inputs.adapter_name }},enable=${{ inputs.adapter_name != '' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build and push qwen3-vl image
         uses: docker/build-push-action@v6
